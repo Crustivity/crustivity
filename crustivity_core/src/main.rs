@@ -9,7 +9,11 @@ use std::{
     cell::UnsafeCell,
     collections::HashMap,
     marker::PhantomData,
+    ops::{Deref, DerefMut},
 };
+
+trait Component: Send + 'static {}
+impl<T: Send + 'static> Component for T {}
 
 struct Table<T> {
     data: Vec<UnsafeCell<T>>,
@@ -31,7 +35,7 @@ impl World {
         World(HashMap::new())
     }
 
-    fn insert<T: Send + 'static>(&mut self, t: T) -> Variable<T> {
+    fn insert<T: Component>(&mut self, t: T) -> Variable<T> {
         let table = self
             .0
             .entry(TypeId::of::<T>())
@@ -67,7 +71,7 @@ impl<T> Clone for Variable<T> {
 
 impl<T> Copy for Variable<T> {}
 
-impl<T: Send + 'static> Variable<T> {
+impl<T: Component> Variable<T> {
     fn new(t: T, world: &mut World) -> Self {
         world.insert(t)
     }
@@ -104,45 +108,87 @@ impl<T: Send + 'static> Variable<T> {
     }
 }
 
+trait RefKind<T: Component> {
+    unsafe fn from_ref(t: *mut T) -> Self;
+}
+
+struct Ref<'a, T: Component>(&'a T);
+struct Mut<'a, T: Component>(&'a mut T);
+
+impl<'a, T: Component> RefKind<T> for Ref<'a, T> {
+    unsafe fn from_ref(t: *mut T) -> Self {
+        Self(unsafe { &*t })
+    }
+}
+impl<'a, T: Component> RefKind<T> for Mut<'a, T> {
+    unsafe fn from_ref(t: *mut T) -> Self {
+        Self(unsafe { &mut *t })
+    }
+}
+
+impl<'a, T: Component> Deref for Ref<'a, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        self.0
+    }
+}
+impl<'a, T: Component> Deref for Mut<'a, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        self.0
+    }
+}
+impl<'a, T: Component> DerefMut for Mut<'a, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0
+    }
+}
+
 trait CrusTuple {
     type Vars: Clone;
 }
 
-impl<T: Send + 'static> CrusTuple for (T,) {
+impl CrusTuple for () {
+    type Vars = ();
+}
+
+impl<T: Component> CrusTuple for (T,) {
     type Vars = (Variable<T>,);
 }
 
-impl<T0: Send + 'static, T1: Send + 'static> CrusTuple for (T0, T1) {
+impl<T0: Component, T1: Component> CrusTuple for (T0, T1) {
     type Vars = (Variable<T0>, Variable<T1>);
 }
 
 trait Call<Vars: CrusTuple> {
-    fn call_from_world(self, a: <Vars as CrusTuple>::Vars, world: &mut World);
+    fn call_from_world(self, a: Vars::Vars, world: &mut World);
 }
 
-// impl<Func: Fn()> Call<()> for Func {
-//     fn call_from_world(self, a: (), world: &mut World) {
-//         (self)();
-//     }
-// }
+impl Call<()> for fn() {
+    fn call_from_world(self, _a: (), _world: &mut World) {
+        (self)();
+    }
+}
 
-impl<T: Send + 'static> Call<(T,)> for fn(&mut T) {
+impl<T: Component, R: RefKind<T>> Call<(T,)> for fn(R) {
     fn call_from_world(self, a: <(T,) as CrusTuple>::Vars, world: &mut World) {
         let arg0 = a.0.get_mut(world);
         if let Some(arg0) = arg0 {
-            (self)(unsafe { &mut *arg0 });
+            (self)(unsafe { R::from_ref(arg0) });
         }
         a.0.reset_mut(world);
     }
 }
 
-impl<T0: Send + 'static, T1: Send + 'static> Call<(T0, T1)> for fn(&mut T0, &mut T1) {
-    fn call_from_world(self, a: (Variable<T0>, Variable<T1>), world: &mut World) {
+impl<T0: Component, T1: Component, R0: RefKind<T0>, R1: RefKind<T1>> Call<(T0, T1)> for fn(R0, R1) {
+    fn call_from_world(self, a: <(T0, T1) as CrusTuple>::Vars, world: &mut World) {
         let arg0 = a.0.get_mut(world);
         let arg1 = a.1.get_mut(world);
         if let Some(arg0) = arg0 {
             if let Some(arg1) = arg1 {
-                (self)(unsafe { &mut *arg0 }, unsafe { &mut *arg1 });
+                (self)(unsafe { R0::from_ref(arg0) }, unsafe { R1::from_ref(arg1) });
             }
         }
         a.1.reset_mut(world);
@@ -152,7 +198,7 @@ impl<T0: Send + 'static, T1: Send + 'static> Call<(T0, T1)> for fn(&mut T0, &mut
 
 struct Task<Vars: CrusTuple> {
     f: unsafe fn(),
-    dyn_caller: unsafe fn(unsafe fn(), <Vars as CrusTuple>::Vars, &mut World),
+    dyn_caller: unsafe fn(unsafe fn(), Vars::Vars, &mut World),
     v: <Vars as CrusTuple>::Vars,
 }
 
@@ -166,21 +212,26 @@ impl<Vars: CrusTuple> Clone for Task<Vars> {
     }
 }
 
-unsafe fn call_from_world_dyn1<T: Send + 'static>(
+unsafe fn call_from_world_dyn0(f: unsafe fn(), v: (), world: &mut World) {
+    let exact_f: fn() = unsafe { std::mem::transmute(f) };
+    exact_f.call_from_world(v, world);
+}
+
+unsafe fn call_from_world_dyn1<T: Component, R: RefKind<T>>(
     f: unsafe fn(),
     v: (Variable<T>,),
     world: &mut World,
 ) {
-    let exact_f: fn(&mut T) = unsafe { std::mem::transmute(f) };
+    let exact_f: fn(R) = unsafe { std::mem::transmute(f) };
     exact_f.call_from_world(v, world);
 }
 
-unsafe fn call_from_world_dyn2<T0: Send + 'static, T1: Send + 'static>(
+unsafe fn call_from_world_dyn2<T0: Component, T1: Component, R0: RefKind<T0>, R1: RefKind<T1>>(
     f: unsafe fn(),
     v: (Variable<T0>, Variable<T1>),
     world: &mut World,
 ) {
-    let exact_f: fn(&mut T0, &mut T1) = unsafe { std::mem::transmute(f) };
+    let exact_f: fn(R0, R1) = unsafe { std::mem::transmute(f) };
     exact_f.call_from_world(v, world);
 }
 
@@ -192,20 +243,35 @@ impl<T: CrusTuple> Task<T> {
     }
 }
 
-impl<T: Send + 'static> Task<(T,)> {
-    fn new1(f: fn(&mut T), v: Variable<T>) -> Self {
+impl Task<()> {
+    fn new0(f: fn()) -> Self {
         Self {
             f: unsafe { std::mem::transmute(f) },
-            dyn_caller: call_from_world_dyn1::<T>,
+            dyn_caller: call_from_world_dyn0,
+            v: (),
+        }
+    }
+}
+
+impl<T: Component> Task<(T,)> {
+    fn new1<R: RefKind<T>>(f: fn(R), v: Variable<T>) -> Self {
+        Self {
+            f: unsafe { std::mem::transmute(f) },
+            dyn_caller: call_from_world_dyn1::<T, R>,
             v: (v,),
         }
     }
 }
-impl<T0: Send + 'static, T1: Send + 'static> Task<(T0, T1)> {
-    fn new2(f: fn(&mut T0, &mut T1), v0: Variable<T0>, v1: Variable<T1>) -> Self {
+
+impl<T0: Component, T1: Component> Task<(T0, T1)> {
+    fn new2<R0: RefKind<T0>, R1: RefKind<T1>>(
+        f: fn(R0, R1),
+        v0: Variable<T0>,
+        v1: Variable<T1>,
+    ) -> Self {
         Self {
             f: unsafe { std::mem::transmute(f) },
-            dyn_caller: call_from_world_dyn2::<T0, T1>,
+            dyn_caller: call_from_world_dyn2::<T0, T1, R0, R1>,
             v: (v0, v1),
         }
     }
@@ -213,28 +279,36 @@ impl<T0: Send + 'static, T1: Send + 'static> Task<(T0, T1)> {
 
 fn main() {
     let mut world = World::new();
-    let a = Variable::new("Test".to_string(), &mut world);
-    let b = Variable::new(42, &mut world);
+    let world = &mut world;
+    let a = Variable::new("Test".to_string(), world);
+    let b = Variable::new(42, world);
 
-    fn append_str(a: &mut String) {
+    fn append_str(mut a: Mut<String>) {
         a.push_str(" Test");
     }
-    fn inc_num(b: &mut i32) {
+
+    fn inc_num(mut b: Mut<i32>) {
         *b += 1;
     }
 
-    fn print(a: &mut String, b: &mut i32) {
-        println!("a: {a}, b: {b}");
+    fn print(a: Ref<String>, b: Ref<i32>) {
+        println!("a: {}, b: {}", *a, *b);
     }
 
+    fn check() {
+        println!("Hello World");
+    }
+
+    let check = Task::new0(check);
     let inc_num = Task::new1(inc_num, b);
     let append_str = Task::new1(append_str, a);
     let print = Task::new2(print, a, b);
 
-    print.call_from_world(&mut world);
-    inc_num.call_from_world(&mut world);
-    append_str.call_from_world(&mut world);
-    print.call_from_world(&mut world);
+    check.call_from_world(world);
+    print.call_from_world(world);
+    inc_num.call_from_world(world);
+    append_str.call_from_world(world);
+    print.call_from_world(world);
 
     // (print as fn(&mut String, &mut i32)).call_from_world((a, b), &mut world);
     // call_from_world(print, (a, b), &mut world);
