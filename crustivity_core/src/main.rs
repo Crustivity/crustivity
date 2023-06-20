@@ -15,37 +15,75 @@ use std::{
 trait Component: Send + 'static {}
 impl<T: Send + 'static> Component for T {}
 
-struct Table<T> {
+struct VarTable<T> {
     data: Vec<UnsafeCell<T>>,
     gen: Vec<(usize, bool)>,
 }
-impl<T> Table<T> {
+
+struct TaskTable<T> {
+    data: Vec<T>,
+    gen: Vec<usize>,
+}
+
+impl<T> VarTable<T> {
     fn new() -> Self {
-        Table {
+        VarTable {
             data: Vec::new(),
             gen: Vec::new(),
         }
     }
 }
 
-struct World(HashMap<TypeId, Box<dyn Any + Send>>);
+impl<T> TaskTable<T> {
+    fn new() -> Self {
+        TaskTable {
+            data: Vec::new(),
+            gen: Vec::new(),
+        }
+    }
+}
+
+struct World {
+    vars: HashMap<TypeId, Box<dyn Any + Send>>,
+    tasks: HashMap<TypeId, Box<dyn Any + Send>>,
+}
 
 impl World {
     fn new() -> Self {
-        World(HashMap::new())
+        World {
+            vars: HashMap::new(),
+            tasks: HashMap::new(),
+        }
     }
 
-    fn insert<T: Component>(&mut self, t: T) -> Variable<T> {
+    fn insert_var<T: Component>(&mut self, t: T) -> Variable<T> {
         let table = self
-            .0
+            .vars
             .entry(TypeId::of::<T>())
-            .or_insert_with(|| Box::new(Table::<T>::new()) as Box<dyn Any + Send>)
+            .or_insert_with(|| Box::new(VarTable::<T>::new()) as Box<dyn Any + Send>)
             .as_mut()
-            .downcast_mut::<Table<T>>()
-            .expect("Any to be a Table<T>");
+            .downcast_mut::<VarTable<T>>()
+            .expect("Any to be a VarTable<T>");
         table.data.push(UnsafeCell::new(t));
         table.gen.push((0, false));
         Variable {
+            index: table.data.len() - 1,
+            generation: 0,
+            _t: PhantomData::default(),
+        }
+    }
+
+    fn insert_task<T: Component>(&mut self, t: T) -> TaskData<T> {
+        let table = self
+            .tasks
+            .entry(TypeId::of::<T>())
+            .or_insert_with(|| Box::new(TaskTable::<T>::new()) as Box<dyn Any + Send>)
+            .as_mut()
+            .downcast_mut::<TaskTable<T>>()
+            .expect("Any to be a TaskTable<T>");
+        table.data.push(t);
+        table.gen.push(0);
+        TaskData {
             index: table.data.len() - 1,
             generation: 0,
             _t: PhantomData::default(),
@@ -73,15 +111,15 @@ impl<T> Copy for Variable<T> {}
 
 impl<T: Component> Variable<T> {
     fn new(t: T, world: &mut World) -> Self {
-        world.insert(t)
+        world.insert_var(t)
     }
 
     fn get_mut(self, world: &mut World) -> Option<*mut T> {
         let table = world
-            .0
+            .vars
             .get_mut(&TypeId::of::<T>())?
-            .downcast_mut::<Table<T>>()
-            .expect("any to be Table<T>");
+            .downcast_mut::<VarTable<T>>()
+            .expect("any to be VarTable<T>");
         let (gen, in_use) = table.gen.get_mut(self.index)?;
         if *gen != self.generation {
             return None;
@@ -95,16 +133,80 @@ impl<T: Component> Variable<T> {
 
     fn reset_mut(self, world: &mut World) {
         let Some(table) = world
-            .0
+            .vars
             .get_mut(&TypeId::of::<T>()) else {return};
         let table = table
-            .downcast_mut::<Table<T>>()
-            .expect("any to be Table<T>");
+            .downcast_mut::<VarTable<T>>()
+            .expect("any to be VarTable<T>");
         let Some((gen, in_use)) = table.gen.get_mut(self.index) else {return};
         if *gen != self.generation {
             return;
         }
         *in_use = false;
+    }
+}
+
+struct TaskData<T> {
+    index: usize,
+    generation: usize,
+    _t: PhantomData<T>,
+}
+
+#[derive(Clone, Copy)]
+struct TaskDataDyn {
+    index: usize,
+    generation: usize,
+    tid: TypeId,
+}
+
+impl TaskDataDyn {
+    fn downcast<T: Component>(self) -> Option<TaskData<T>> {
+        if self.tid == TypeId::of::<T>() {
+            Some(TaskData {
+                index: self.index,
+                generation: self.generation,
+                _t: PhantomData::default(),
+            })
+        } else {
+            None
+        }
+    }
+}
+
+impl<T> Clone for TaskData<T> {
+    fn clone(&self) -> Self {
+        Self {
+            index: self.index,
+            generation: self.generation,
+            _t: PhantomData,
+        }
+    }
+}
+
+impl<T> Copy for TaskData<T> {}
+
+impl<T: Component> TaskData<T> {
+    fn erase(self) -> TaskDataDyn {
+        TaskDataDyn {
+            index: self.index,
+            generation: self.generation,
+            tid: TypeId::of::<T>(),
+        }
+    }
+}
+
+impl<T: Component + Clone> TaskData<T> {
+    fn get(self, world: &mut World) -> Option<T> {
+        let table = world
+            .tasks
+            .get(&TypeId::of::<T>())?
+            .downcast_ref::<TaskTable<T>>()
+            .expect("any to be TaskTable<T>");
+        let gen = *table.gen.get(self.index)?;
+        if gen != self.generation {
+            return None;
+        }
+        Some(table.data[self.index].clone())
     }
 }
 
@@ -147,7 +249,7 @@ impl<'a, T: Component> DerefMut for Mut<'a, T> {
 }
 
 trait CrusTuple {
-    type Vars: Clone;
+    type Vars: Clone + Component;
 }
 
 impl CrusTuple for () {
@@ -163,17 +265,18 @@ impl<T0: Component, T1: Component> CrusTuple for (T0, T1) {
 }
 
 trait Call<Vars: CrusTuple> {
-    fn call_from_world(self, a: Vars::Vars, world: &mut World);
+    fn call_from_world(self, a: TaskData<Vars::Vars>, world: &mut World);
 }
 
 impl Call<()> for fn() {
-    fn call_from_world(self, _a: (), _world: &mut World) {
+    fn call_from_world(self, _a: TaskData<()>, _world: &mut World) {
         (self)();
     }
 }
 
 impl<T: Component, R: RefKind<T>> Call<(T,)> for fn(R) {
-    fn call_from_world(self, a: <(T,) as CrusTuple>::Vars, world: &mut World) {
+    fn call_from_world(self, a: TaskData<<(T,) as CrusTuple>::Vars>, world: &mut World) {
+        let Some(a) = a.get(world) else {return};
         let arg0 = a.0.get_mut(world);
         if let Some(arg0) = arg0 {
             (self)(unsafe { R::from_ref(arg0) });
@@ -183,7 +286,8 @@ impl<T: Component, R: RefKind<T>> Call<(T,)> for fn(R) {
 }
 
 impl<T0: Component, T1: Component, R0: RefKind<T0>, R1: RefKind<T1>> Call<(T0, T1)> for fn(R0, R1) {
-    fn call_from_world(self, a: <(T0, T1) as CrusTuple>::Vars, world: &mut World) {
+    fn call_from_world(self, a: TaskData<<(T0, T1) as CrusTuple>::Vars>, world: &mut World) {
+        let Some(a) = a.get(world) else {return};
         let arg0 = a.0.get_mut(world);
         let arg1 = a.1.get_mut(world);
         if let Some(arg0) = arg0 {
@@ -198,8 +302,8 @@ impl<T0: Component, T1: Component, R0: RefKind<T0>, R1: RefKind<T1>> Call<(T0, T
 
 struct Task<Vars: CrusTuple> {
     f: unsafe fn(),
-    dyn_caller: unsafe fn(unsafe fn(), Vars::Vars, &mut World),
-    v: <Vars as CrusTuple>::Vars,
+    dyn_caller: unsafe fn(unsafe fn(), TaskDataDyn, &mut World),
+    v: TaskData<Vars::Vars>,
 }
 
 impl<Vars: CrusTuple> Clone for Task<Vars> {
@@ -207,58 +311,86 @@ impl<Vars: CrusTuple> Clone for Task<Vars> {
         Self {
             f: self.f,
             dyn_caller: self.dyn_caller,
-            v: self.v.clone(),
+            v: self.v,
         }
     }
 }
 
-unsafe fn call_from_world_dyn0(f: unsafe fn(), v: (), world: &mut World) {
+impl<Vars: CrusTuple> Copy for Task<Vars> {}
+
+#[derive(Clone, Copy)]
+struct TaskDyn {
+    f: unsafe fn(),
+    dyn_caller: unsafe fn(unsafe fn(), TaskDataDyn, &mut World),
+    v: TaskDataDyn,
+}
+
+unsafe fn call_from_world_dyn0(f: unsafe fn(), variables: TaskDataDyn, world: &mut World) {
     let exact_f: fn() = unsafe { std::mem::transmute(f) };
-    exact_f.call_from_world(v, world);
+    let Some(exact_variables) = variables.downcast::<<() as CrusTuple>::Vars>() else {eprintln!("unexpected typeid"); return};
+    exact_f.call_from_world(exact_variables, world);
 }
 
 unsafe fn call_from_world_dyn1<T: Component, R: RefKind<T>>(
     f: unsafe fn(),
-    v: (Variable<T>,),
+    variables: TaskDataDyn,
     world: &mut World,
 ) {
     let exact_f: fn(R) = unsafe { std::mem::transmute(f) };
-    exact_f.call_from_world(v, world);
+    let Some(exact_variables) = variables.downcast::<<(T,) as CrusTuple>::Vars>() else {eprintln!("unexpected typeid"); return};
+    exact_f.call_from_world(exact_variables, world);
 }
 
 unsafe fn call_from_world_dyn2<T0: Component, T1: Component, R0: RefKind<T0>, R1: RefKind<T1>>(
     f: unsafe fn(),
-    v: (Variable<T0>, Variable<T1>),
+    variables: TaskDataDyn,
     world: &mut World,
 ) {
     let exact_f: fn(R0, R1) = unsafe { std::mem::transmute(f) };
-    exact_f.call_from_world(v, world);
+    let Some(exact_variables) = variables.downcast::<<(T0, T1) as CrusTuple>::Vars>() else {eprintln!("unexpected typeid"); return};
+    exact_f.call_from_world(exact_variables, world);
 }
 
 impl<T: CrusTuple> Task<T> {
-    fn call_from_world(&self, world: &mut World) {
+    fn call_from_world(self, world: &mut World) {
         unsafe {
-            (self.dyn_caller)(self.f, self.v.clone(), world);
+            (self.dyn_caller)(self.f, self.v.erase(), world);
+        }
+    }
+
+    fn erase(self) -> TaskDyn {
+        TaskDyn {
+            f: self.f,
+            dyn_caller: self.dyn_caller,
+            v: self.v.erase(),
+        }
+    }
+}
+
+impl TaskDyn {
+    fn call_from_world(self, world: &mut World) {
+        unsafe {
+            (self.dyn_caller)(self.f, self.v, world);
         }
     }
 }
 
 impl Task<()> {
-    fn new0(f: fn()) -> Self {
+    fn new0(f: fn(), world: &mut World) -> Self {
         Self {
             f: unsafe { std::mem::transmute(f) },
             dyn_caller: call_from_world_dyn0,
-            v: (),
+            v: world.insert_task(()),
         }
     }
 }
 
 impl<T: Component> Task<(T,)> {
-    fn new1<R: RefKind<T>>(f: fn(R), v: Variable<T>) -> Self {
+    fn new1<R: RefKind<T>>(f: fn(R), v: Variable<T>, world: &mut World) -> Self {
         Self {
             f: unsafe { std::mem::transmute(f) },
             dyn_caller: call_from_world_dyn1::<T, R>,
-            v: (v,),
+            v: world.insert_task((v,)),
         }
     }
 }
@@ -268,11 +400,12 @@ impl<T0: Component, T1: Component> Task<(T0, T1)> {
         f: fn(R0, R1),
         v0: Variable<T0>,
         v1: Variable<T1>,
+        world: &mut World,
     ) -> Self {
         Self {
             f: unsafe { std::mem::transmute(f) },
             dyn_caller: call_from_world_dyn2::<T0, T1, R0, R1>,
-            v: (v0, v1),
+            v: world.insert_task((v0, v1)),
         }
     }
 }
@@ -299,19 +432,16 @@ fn main() {
         println!("Hello World");
     }
 
-    let check = Task::new0(check);
-    let inc_num = Task::new1(inc_num, b);
-    let append_str = Task::new1(append_str, a);
-    let print = Task::new2(print, a, b);
+    let check = Task::new0(check, world).erase();
+    let inc_num = Task::new1(inc_num, b, world);
+    let append_str = Task::new1(append_str, a, world);
+    let print = Task::new2(print, a, b, world).erase();
 
     check.call_from_world(world);
     print.call_from_world(world);
     inc_num.call_from_world(world);
     append_str.call_from_world(world);
     print.call_from_world(world);
-
-    // (print as fn(&mut String, &mut i32)).call_from_world((a, b), &mut world);
-    // call_from_world(print, (a, b), &mut world);
 }
 
 #[cfg(test)]
