@@ -12,6 +12,10 @@ use std::{
     ops::{Deref, DerefMut},
 };
 
+mod stable_vec;
+
+use stable_vec::SVec;
+
 trait Component: Send + 'static {}
 impl<T: Send + 'static> Component for T {}
 
@@ -30,20 +34,20 @@ impl<T> TrackedVariable<T> {
 }
 
 struct VarTable<T> {
-    data: Vec<TrackedVariable<T>>,
-    gen: Vec<(usize, bool)>,
+    data: SVec<TrackedVariable<T>>,
+    gen: SVec<(usize, bool)>,
 }
 
 struct TaskTable<T> {
-    data: Vec<T>,
-    gen: Vec<usize>,
+    data: SVec<T>,
+    gen: SVec<usize>,
 }
 
 impl<T> VarTable<T> {
     fn new() -> Self {
         VarTable {
-            data: Vec::new(),
-            gen: Vec::new(),
+            data: SVec::new(),
+            gen: SVec::new(),
         }
     }
 }
@@ -51,8 +55,8 @@ impl<T> VarTable<T> {
 impl<T> TaskTable<T> {
     fn new() -> Self {
         TaskTable {
-            data: Vec::new(),
-            gen: Vec::new(),
+            data: SVec::new(),
+            gen: SVec::new(),
         }
     }
 }
@@ -78,10 +82,9 @@ impl World {
             .as_mut()
             .downcast_mut::<VarTable<T>>()
             .expect("Any to be a VarTable<T>");
-        table.data.push(TrackedVariable::new(t));
         table.gen.push((0, false));
         Variable {
-            index: table.data.len() - 1,
+            index: table.data.push(TrackedVariable::new(t)),
             generation: 0,
             _t: PhantomData::default(),
         }
@@ -102,10 +105,9 @@ impl World {
             .as_mut()
             .downcast_mut::<TaskTable<T>>()
             .expect("Any to be a TaskTable<T>");
-        table.data.push(t);
         table.gen.push(0);
         TaskData {
-            index: table.data.len() - 1,
+            index: table.data.push(t),
             generation: 0,
             _t: PhantomData::default(),
         }
@@ -154,7 +156,7 @@ impl<T: Component> Variable<T> {
             return None;
         }
         *in_use = true;
-        let var = &table.data[self.index]; 
+        let var = table.data.get(self.index)?;
         Some((var.variable.get(), var.dependents.clone()))
     }
 
@@ -183,7 +185,7 @@ impl<T: Component> Variable<T> {
         if gen != self.generation || in_use {
             return;
         }
-        let var = &mut table.data[self.index];
+        let Some(var) = table.data.get_mut(self.index) else {return};
         *var.variable.get_mut() = t;
         for d in var.dependents.clone() {
             d.call_from_world(world);
@@ -217,7 +219,7 @@ impl<T: Component> Variable<T> {
                 self.index,
                 self.generation,
                 in_use,
-                table.data[self.index].dependents.len(),
+                table.data.get(self.index).unwrap().dependents.len(),
             );
         } else {
             println!(
@@ -311,7 +313,7 @@ impl<T: Component + Clone> TaskData<T> {
         if gen != self.generation {
             return None;
         }
-        Some(table.data[self.index].clone())
+        table.data.get(self.index).cloned()
     }
 }
 
@@ -592,10 +594,6 @@ fn main() {
         *s = n.to_string();
     }
 
-    fn print(a: Ref<String>) {
-        println!("string: {}", *a);
-    }
-
     fn check() {
         println!("Hello World");
     }
@@ -603,7 +601,7 @@ fn main() {
     let check = Task::new0(check, world).erase();
     let inc_num = Task::new1(inc_num, b, world).erase();
     let format_num = Task::new2(format_num, a, b, world);
-    let print = Task::new1(print, a, world);
+    let print = Task::new1(|s: Ref<_>| println!("{}", *s), a, world);
 
     world.effect(print);
     world.effect(format_num);
@@ -614,10 +612,3 @@ fn main() {
     inc_num.call_from_world(world);
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test() {}
-}
