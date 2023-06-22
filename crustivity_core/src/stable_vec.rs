@@ -16,9 +16,13 @@ struct Bucket<T> {
 impl<T> Bucket<T> {
     fn new() -> Self {
         Self {
-            data: Box::new(unsafe {
-                MaybeUninit::<[MaybeUninit<T>; BUCKET_SIZE]>::uninit().assume_init()
-            }),
+            data: Box::new(
+                // SAFETY: `MaybeUninit::uninit_array` does the same thing. does the same thing.
+                #[allow(clippy::uninit_assumed_init)]
+                unsafe {
+                    MaybeUninit::<[MaybeUninit<T>; BUCKET_SIZE]>::uninit().assume_init()
+                },
+            ),
             used: [0u8; BUCKET_SIZE / (u8::BITS as usize)],
         }
     }
@@ -130,8 +134,7 @@ impl<T> SVec<T> {
                 if *used_byte != u8::MAX {
                     for (bit_idx, bit) in (0..8).map(|bit_idx| (bit_idx, 1u8 << bit_idx)) {
                         if *used_byte & bit == 0 {
-                            let entry = &mut bucket.data
-                                [byte_idx * (u8::BITS as usize) + (bit_idx as usize)];
+                            let entry = &mut bucket.data[byte_idx * (u8::BITS as usize) + bit_idx];
                             *used_byte |= bit;
                             entry.write(t);
                             if bucket.used[byte_idx..]
@@ -177,17 +180,16 @@ impl<T> SVec<T> {
     }
 
     pub(crate) fn remove(&mut self, index: usize) -> Option<T> {
-        let Some(association) = self.association.mut_valid(index / BUCKET_SIZE) else {println!("KUKUK"); return None};
+        let association = self.association.mut_valid(index / BUCKET_SIZE)?;
 
         let bucket = self.data.get_mut(association.bucket_idx)?;
         let bucket_index = index % BUCKET_SIZE;
         let bit: u8 = 1 << (bucket_index % (u8::BITS as usize));
         let used_idx = bucket_index / (u8::BITS as usize);
 
-        let Some(used_byte) = bucket.used.get_mut(used_idx) else {println!("hmmm"); return None};
+        let used_byte = bucket.used.get_mut(used_idx)?;
 
         if (*used_byte & bit) == 0 {
-            println!("item non existent");
             return None;
         }
 
@@ -198,10 +200,6 @@ impl<T> SVec<T> {
             unsafe { uninit.assume_init() }
         });
 
-        // println!(
-        //     "index: {index}, buclet_index: {bucket_index}, used_byte: {}",
-        //     *used_byte
-        // );
         association.state = if *used_byte == u8::MAX {
             AssociationState::Full
         } else {
@@ -221,13 +219,10 @@ impl<T> SVec<T> {
                 .bucket_idx = asso_bucket_idx;
         }
 
-        if t.is_none() {
-            println!("What");
-        }
-
         t
     }
 
+    #[allow(dead_code)]
     fn print_meta_info(&self) {
         println!("buckets: {}", self.data.len());
         println!(
@@ -244,10 +239,11 @@ impl<T> SVec<T> {
                 let str_repr = String::from_utf8_lossy(&str_repr);
                 print!("{str_repr}");
             }
-            println!("");
+            println!();
         }
     }
 
+    #[allow(dead_code)]
     fn association_state(&self) -> String {
         String::from_utf8_lossy(
             &self
