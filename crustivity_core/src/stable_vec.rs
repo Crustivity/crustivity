@@ -3,6 +3,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
+
 use std::mem::MaybeUninit;
 
 const BUCKET_SIZE: usize = 1 << 8;
@@ -256,6 +257,43 @@ impl<T> SVec<T> {
                 .collect::<Vec<_>>(),
         )
         .into_owned()
+    }
+}
+
+impl<T> Drop for SVec<T> {
+    fn drop(&mut self) {
+        for association in self
+            .association
+            .iter()
+            .filter(|a| a.state != AssociationState::Disabled)
+        {
+            let Some(bucket) = self.data.get_mut(association.bucket_idx) else {continue;};
+            match association.state {
+                AssociationState::Disabled => unreachable!(),
+                AssociationState::Full => {
+                    for item in &mut *bucket.data {
+                        unsafe { item.assume_init_drop() };
+                    }
+                }
+                AssociationState::Hollow => {
+                    for (byte_idx, byte) in bucket
+                        .used
+                        .iter()
+                        .copied()
+                        .enumerate()
+                        .filter(|(_, byte)| *byte != 0)
+                    {
+                        for index in (0usize..8)
+                            .filter(|bit_idx| (1u8 << bit_idx) & byte != 0)
+                            .map(|bit| byte_idx * (u8::BITS as usize) + bit)
+                        {
+                            let Some(item) = bucket.data.get_mut(index) else {continue;};
+                            unsafe { item.assume_init_drop() };
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
