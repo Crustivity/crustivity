@@ -4,81 +4,105 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
+#![feature(strict_provenance)]
+
 use std::{
     any::{Any, TypeId},
     cell::UnsafeCell,
-    collections::HashMap,
+    collections::VecDeque,
     marker::PhantomData,
+    mem::MaybeUninit,
     ops::{Deref, DerefMut},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
 
+pub mod constraints;
 pub mod spawner;
-mod stable_vec;
+mod world;
 
-use spawner::Spawner;
-use stable_vec::SVec;
+use crate::spawner::Spawner;
+pub use crate::world::World;
+use constraints::{ConstraintSystem, EffectPath};
+use dashmap::DashMap;
+use parking_lot::Mutex;
+use sharded_slab::Slab;
+use world::{ActivationEntry, AnyType};
 
-pub trait Component: Send + 'static {}
-impl<T: Send + 'static> Component for T {}
+trait MaybeUninitPtrTransmut {
+    type Inner;
 
-struct TrackedVariable<T> {
-    variable: UnsafeCell<T>,
-    dependents: Vec<TaskDyn>,
+    fn inner_ptr(self) -> *mut Self::Inner;
 }
 
-impl<T> TrackedVariable<T> {
-    fn new(t: T) -> Self {
-        Self {
-            variable: UnsafeCell::new(t),
-            dependents: Vec::new(),
-        }
+impl<T> MaybeUninitPtrTransmut for *mut MaybeUninit<T> {
+    type Inner = T;
+
+    fn inner_ptr(self) -> *mut Self::Inner {
+        unsafe { std::mem::transmute::<Self, *mut Self::Inner>(self) }
     }
 }
 
-struct VarTable<T> {
-    data: SVec<UnsafeCell<T>>,
-    gen: SVec<(usize, bool)>,
+trait ToSome: Sized {
+    fn some(self) -> Option<Self>;
 }
 
-struct EventVarTable<T> {
-    data: SVec<TrackedVariable<T>>,
-    gen: SVec<(usize, bool)>,
+impl<T: Sized> ToSome for T {
+    fn some(self) -> Option<Self> {
+        Some(self)
+    }
 }
+
+pub trait Component: Send + Sync + 'static {}
+impl<T: Send + Sync + 'static> Component for T {}
+
+struct VarTable<T> {
+    data: Slab<UnsafeCell<T>>,
+}
+
+unsafe impl<T: Send> Sync for VarTable<T> {}
+
+struct EventTable<T> {
+    data: UnsafeCell<MaybeUninit<T>>,
+    has_data: AtomicBool,
+    activations: Mutex<VecDeque<T>>,
+}
+
+unsafe impl<T: Send> Sync for EventTable<T> {}
 
 struct TaskTable<T> {
-    data: SVec<T>,
-    gen: SVec<usize>,
+    data: Slab<UnsafeCell<T>>,
 }
+
+unsafe impl<T: Send> Sync for TaskTable<T> {}
 
 struct ResourceTable<T> {
     data: UnsafeCell<T>,
-    in_use: bool,
 }
+
+unsafe impl<T: Send> Sync for ResourceTable<T> {}
 
 impl<T> VarTable<T> {
     fn new() -> Self {
-        Self {
-            data: SVec::new(),
-            gen: SVec::new(),
-        }
+        Self { data: Slab::new() }
     }
 }
 
-impl<T> EventVarTable<T> {
+impl<T> EventTable<T> {
     fn new() -> Self {
         Self {
-            data: SVec::new(),
-            gen: SVec::new(),
+            data: UnsafeCell::new(MaybeUninit::uninit()),
+            has_data: AtomicBool::new(false),
+            activations: Mutex::new(VecDeque::new()),
         }
     }
 }
 
 impl<T> TaskTable<T> {
     fn new() -> Self {
-        Self {
-            data: SVec::new(),
-            gen: SVec::new(),
-        }
+        Self { data: Slab::new() }
     }
 }
 
@@ -86,98 +110,106 @@ impl<T> ResourceTable<T> {
     fn new(data: T) -> Self {
         Self {
             data: UnsafeCell::new(data),
-            in_use: false,
         }
     }
 }
 
-pub struct World {
-    vars: HashMap<TypeId, Box<dyn Any + Send>>,
-    event_vars: HashMap<TypeId, Box<dyn Any + Send>>,
-    tasks: HashMap<TypeId, Box<dyn Any + Send>>,
-    resources: HashMap<TypeId, Box<dyn Any + Send>>,
+impl AnyType {
+    fn variable<T: Component>() -> Self {
+        Self {
+            any: Box::new(VarTable::<T>::new()) as Box<dyn Any + Send + Sync>,
+        }
+    }
+
+    fn event<T: Component>() -> Self {
+        Self {
+            any: Box::new(EventTable::<T>::new()) as Box<dyn Any + Send + Sync>,
+        }
+    }
+
+    fn resource<T: Component>(t: T) -> Self {
+        Self {
+            any: Box::new(ResourceTable::new(t)) as Box<dyn Any + Send + Sync>,
+        }
+    }
+
+    fn task<T: Component>() -> Self {
+        Self {
+            any: Box::new(TaskTable::<T>::new()) as Box<dyn Any + Send + Sync>,
+        }
+    }
+
+    fn get<TTable: Send + 'static>(&self, err_msg: &'static str) -> &TTable {
+        self.any.downcast_ref::<TTable>().expect(err_msg)
+    }
+}
+
+impl Default for World {
+    fn default() -> Self {
+        World::new()
+    }
 }
 
 impl World {
     pub fn new() -> Self {
         World {
-            vars: HashMap::new(),
-            event_vars: HashMap::new(),
-            tasks: HashMap::new(),
-            resources: HashMap::new(),
+            vars: DashMap::new(),
+            events: DashMap::new(),
+            tasks: DashMap::new(),
+            resources: DashMap::new(),
+
+            activations: Mutex::new(VecDeque::new()),
         }
     }
 
-    fn insert_var<T: Component>(&mut self, t: T) -> Variable<T> {
-        let table = self
-            .vars
-            .entry(TypeId::of::<T>())
-            .or_insert_with(|| Box::new(VarTable::<T>::new()) as Box<dyn Any + Send>)
-            .as_mut()
-            .downcast_mut::<VarTable<T>>()
-            .expect("Any to be a VarTable<T>");
-        table.gen.push((0, false));
+    fn insert_var<T: Component>(&self, t: T) -> Variable<T> {
+        let type_id = TypeId::of::<T>();
+        let any = if let Some(any) = self.vars.get(&type_id) {
+            any
+        } else {
+            self.vars.insert(type_id, AnyType::variable::<T>());
+            self.vars.get(&type_id).unwrap()
+        };
+        let table = any.get::<VarTable<T>>("any to be a VarTable<T>");
         Variable {
-            index: table.data.push(UnsafeCell::new(t)),
-            generation: 0,
+            index: table
+                .data
+                .insert(UnsafeCell::new(t))
+                .expect("out of memory"),
             _t: PhantomData::default(),
         }
     }
 
-    fn insert_event_var<T: Component>(&mut self, t: T) -> EventVariable<T> {
-        let table = self
-            .event_vars
-            .entry(TypeId::of::<T>())
-            .or_insert_with(|| Box::new(EventVarTable::<T>::new()) as Box<dyn Any + Send>)
-            .as_mut()
-            .downcast_mut::<EventVarTable<T>>()
-            .expect("Any to be a EventVarTable<T>");
-        table.gen.push((0, false));
-        EventVariable {
-            index: table.data.push(TrackedVariable::new(t)),
-            generation: 0,
-            _t: PhantomData::default(),
-        }
-    }
-
-    fn insert_task<T: Component>(&mut self, t: T) -> TaskData<T> {
-        let table = self
-            .tasks
-            .entry(TypeId::of::<T>())
-            .or_insert_with(|| Box::new(TaskTable::<T>::new()) as Box<dyn Any + Send>)
-            .as_mut()
-            .downcast_mut::<TaskTable<T>>()
-            .expect("Any to be a TaskTable<T>");
-        table.gen.push(0);
+    fn insert_task<T: Component>(&self, t: T) -> TaskData<T> {
+        let type_id = TypeId::of::<T>();
+        let any = if let Some(any) = self.tasks.get(&type_id) {
+            any
+        } else {
+            self.tasks.insert(type_id, AnyType::task::<T>());
+            self.tasks.get(&type_id).unwrap()
+        };
+        let table = any.get::<TaskTable<T>>("any to be a TaskTable<T>");
         TaskData {
-            index: table.data.push(t),
-            generation: 0,
+            index: table
+                .data
+                .insert(UnsafeCell::new(t))
+                .expect("out of memory"),
             _t: PhantomData::default(),
         }
     }
 
-    pub fn insert_or_replace_resource<T: Component>(&mut self, mut t: T) -> Option<T> {
-        match self.resources.entry(TypeId::of::<T>()) {
-            std::collections::hash_map::Entry::Occupied(o) => {
-                std::mem::swap(
-                    o.into_mut()
-                        .downcast_mut::<ResourceTable<T>>()
-                        .expect("Any to be a ResourceTable<T>")
-                        .data
-                        .get_mut(),
-                    &mut t,
-                );
-                Some(t)
-            }
-            std::collections::hash_map::Entry::Vacant(v) => {
-                v.insert(Box::new(ResourceTable::new(t)) as Box<dyn Any + Send>);
-                None
-            }
+    pub fn insert_resource<T: Component>(&self, t: T) -> Result<(), T> {
+        let type_id = TypeId::of::<T>();
+        if self.resources.contains_key(&type_id) {
+            Err(t)
+        } else {
+            _ = self.resources.insert(type_id, AnyType::resource(t));
+            Ok(())
         }
     }
 
     fn register_vars<T: TaskParameters>(
-        &mut self,
+        &self,
         task_vars: TaskData<T>,
         register: &mut dyn VariableRegister,
     ) {
@@ -185,22 +217,88 @@ impl World {
         task_vars.register_vars(register);
     }
 
-    pub fn start(mut self, f: TaskDyn) {
-        self.insert_or_replace_resource(Spawner::new());
-        f.call_from_world(&mut self);
+    fn emit_event<T: Component>(&self, t: T) {
+        let type_id = TypeId::of::<T>();
+        let any = if let Some(any) = self.events.get(&type_id) {
+            any
+        } else {
+            self.events.insert(type_id, AnyType::event::<T>());
+            self.events.get(&type_id).unwrap()
+        };
+        let event_table = any.get::<EventTable<T>>("any to be EventTable<T>");
+        event_table.activations.lock().push_back(t);
+
+        self.activations
+            .lock()
+            .push_back(ActivationEntry(World::write_activation_and_emit::<T>));
+
+        // TODO: use event structure
+        self.process_one_activation();
+    }
+
+    fn write_activation_and_emit<T: Component>(&self) {
+        let type_id = TypeId::of::<T>();
+        let Some(any) = self.events.get(&type_id) else {return;};
+        let event = any.get::<EventTable<T>>("any to be EventTable<T>");
+        let Some(activation_value) = event.activations.lock().pop_front() else {return;};
+        let data = event.data.get();
+        // SAFETY: TODO: needs lock for concurrent usage
+        let data = unsafe { &mut *data };
+        if event.has_data.load(Ordering::Acquire) {
+            unsafe { data.assume_init_drop() };
+        }
+        data.write(activation_value);
+        event.has_data.store(true, Ordering::Release);
+
+        let system = TaskParameter::<ConstraintSystem>::Resource()
+            .get_mut_ptr(self)
+            .expect("ConstraintSystem to be an existing resource");
+
+        // SAFETY: TODO: needs lock for concurrent usage
+        let system = unsafe { &*system };
+        if let Some(path) = EffectPath::starting_with(Event::<T>, system) {
+            self.execute_effect_path(path);
+        }
+    }
+
+    fn process_one_activation(&self) {
+        let Some(activation) = self.activations.lock().pop_front() else {return;};
+        (activation.0)(self);
+    }
+
+    fn execute_effect_path(&self, path: EffectPath) {
+        for entry in path.tasks {
+            entry.call_from_world(self);
+        }
+        for effect in path.effects {
+            effect.call_from_world(self);
+        }
+    }
+
+    pub fn start(self, f: TaskDyn) {
+        let world = Arc::new(self);
+        let spawner = Spawner::new(Arc::clone(&world));
+        let system = ConstraintSystem::new();
+        world
+            .insert_resource(spawner)
+            .ok()
+            .expect("Spawner to be inserted");
+        world
+            .insert_resource(system)
+            .ok()
+            .expect("ConstraintSystem to be inserted");
+        f.call_from_world(&world);
     }
 }
 
 pub struct Variable<T> {
     index: usize,
-    generation: usize,
     _t: PhantomData<T>,
 }
 
 #[derive(Clone, Copy, PartialEq, PartialOrd, Ord, Eq, Hash)]
 pub struct VariableDyn {
     index: usize,
-    generation: usize,
     tid: TypeId,
 }
 
@@ -208,7 +306,6 @@ impl<T> Clone for Variable<T> {
     fn clone(&self) -> Self {
         Self {
             index: self.index,
-            generation: self.generation,
             _t: PhantomData,
         }
     }
@@ -217,71 +314,22 @@ impl<T> Clone for Variable<T> {
 impl<T> Copy for Variable<T> {}
 
 impl<T: Component> Variable<T> {
-    pub fn new(t: T, world: &mut World) -> Self {
+    pub fn new(t: T, world: &World) -> Self {
         world.insert_var(t)
-    }
-
-    pub fn set(self, t: T, world: &mut World) {
-        let Some(table) = world
-            .vars
-            .get_mut(&TypeId::of::<T>()) else {return};
-        let table = table
-            .downcast_mut::<VarTable<T>>()
-            .expect("any to be VarTable<T>");
-        let Some(&(gen, in_use)) = table.gen.get(self.index) else {return};
-        if gen != self.generation || in_use {
-            return;
-        }
-        let Some(var) = table.data.get_mut(self.index) else {return};
-        *var.get_mut() = t;
     }
 
     fn erase(self) -> VariableDyn {
         VariableDyn {
             index: self.index,
-            generation: self.generation,
             tid: TypeId::of::<T>(),
         }
     }
 }
 
-pub struct EventVariable<T> {
-    index: usize,
-    generation: usize,
-    _t: PhantomData<T>,
-}
-
-#[derive(Clone, Copy, PartialEq, PartialOrd, Ord, Eq, Hash)]
-pub struct EventVariableDyn {
-    index: usize,
-    generation: usize,
-    tid: TypeId,
-}
-
-impl<T> Clone for EventVariable<T> {
-    fn clone(&self) -> Self {
-        Self {
-            index: self.index,
-            generation: self.generation,
-            _t: self._t,
-        }
-    }
-}
-
-impl<T> Copy for EventVariable<T> {}
-
-impl<T: Component> EventVariable<T> {
-    fn new(t: T, world: &mut World) -> Self {
-        world.insert_event_var(t)
-    }
-
-    fn erase(self) -> EventVariableDyn {
-        EventVariableDyn {
-            index: self.index,
-            generation: self.generation,
-            tid: TypeId::of::<T>(),
-        }
-    }
+pub struct EventValue<T>(PhantomData<T>);
+#[allow(non_snake_case)]
+pub fn Event<T: Component>() -> EventValue<T> {
+    EventValue(PhantomData)
 }
 
 pub struct ResourceValue<T: Component>(PhantomData<T>);
@@ -298,22 +346,32 @@ pub enum RefKindVariant {
 
 pub enum TaskParameter<T> {
     Variable(Variable<T>),
-    EventVar(EventVariable<T>),
+    Event(),
     Resource(),
 }
 
 #[derive(Clone, Copy, PartialEq, PartialOrd, Ord, Eq, Hash)]
 pub enum TaskParameterDyn {
     Variable(VariableDyn),
-    EventVar(EventVariableDyn),
+    Event(TypeId),
     Resource(TypeId),
+}
+
+impl std::fmt::Display for TaskParameterDyn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TaskParameterDyn::Variable(v) => write!(f, "Var({})", v.index),
+            TaskParameterDyn::Event(_) => write!(f, "Event()"),
+            TaskParameterDyn::Resource(_) => write!(f, "Res()"),
+        }
+    }
 }
 
 impl<T> Clone for TaskParameter<T> {
     fn clone(&self) -> Self {
         match self {
             TaskParameter::Variable(v) => TaskParameter::Variable(*v),
-            TaskParameter::EventVar(e) => TaskParameter::EventVar(*e),
+            TaskParameter::Event() => TaskParameter::Event(),
             TaskParameter::Resource() => TaskParameter::Resource(),
         }
     }
@@ -322,99 +380,38 @@ impl<T> Clone for TaskParameter<T> {
 impl<T> Copy for TaskParameter<T> {}
 
 impl<T: Component> TaskParameter<T> {
-    fn get_mut_ptr(self, world: &mut World) -> Option<*mut T> {
+    fn get_mut_ptr(self, world: &World) -> Option<*mut T> {
         match self {
-            TaskParameter::Variable(v) => {
-                let table = world
-                    .vars
-                    .get_mut(&TypeId::of::<T>())?
-                    .downcast_mut::<VarTable<T>>()
-                    .expect("any to be VarTable<T>");
-                let (gen, in_use) = table.gen.get_mut(v.index)?;
-                if *gen != v.generation {
-                    return None;
+            TaskParameter::Variable(v) => world
+                .vars
+                .get(&TypeId::of::<T>())?
+                .get::<VarTable<T>>("any to be VarTable<T>")
+                .data
+                .get(v.index)
+                .map(|cell| cell.get()),
+            TaskParameter::Event() => {
+                let any = world.events.get(&TypeId::of::<T>())?;
+                let table = any.get::<EventTable<T>>("any to be EventTable<T>");
+                if table.has_data.load(Ordering::Acquire) {
+                    table.data.get().inner_ptr().some()
+                } else {
+                    None
                 }
-                if *in_use {
-                    return None;
-                }
-                *in_use = true;
-                table.data.get(v.index).map(UnsafeCell::get)
             }
-            TaskParameter::EventVar(e) => {
-                let table = world
-                    .event_vars
-                    .get_mut(&TypeId::of::<T>())?
-                    .downcast_mut::<EventVarTable<T>>()
-                    .expect("any to be EventVarTable<T>");
-                let (gen, in_use) = table.gen.get_mut(e.index)?;
-                if *gen != e.generation {
-                    return None;
-                }
-                if *in_use {
-                    return None;
-                }
-                *in_use = true;
-                table.data.get(e.index).map(|tv| tv.variable.get())
-            }
-            TaskParameter::Resource() => {
-                let res = world
-                    .resources
-                    .get_mut(&TypeId::of::<T>())?
-                    .downcast_mut::<ResourceTable<T>>()
-                    .expect("any to be ResourceTable<T>");
-                if res.in_use {
-                    return None;
-                }
-                res.in_use = true;
-                Some(res.data.get())
-            }
-        }
-    }
-
-    fn reset_mut_ptr(self, world: &mut World) {
-        match self {
-            TaskParameter::Variable(v) => {
-                let Some(table) = world
-                    .vars
-                    .get_mut(&TypeId::of::<T>()) else {return};
-                let table = table
-                    .downcast_mut::<VarTable<T>>()
-                    .expect("any to be VarTable<T>");
-                let Some((gen, in_use)) = table.gen.get_mut(v.index) else {return};
-                if *gen != v.generation {
-                    return;
-                }
-                *in_use = false;
-            }
-            TaskParameter::EventVar(e) => {
-                let Some(table) = world
-                    .vars
-                    .get_mut(&TypeId::of::<T>()) else {return};
-                let table = table
-                    .downcast_mut::<EventVarTable<T>>()
-                    .expect("any to be EventVarTable<T>");
-                let Some((gen, in_use)) = table.gen.get_mut(e.index) else {return};
-                if *gen != e.generation {
-                    return;
-                }
-                *in_use = false;
-            }
-
-            TaskParameter::Resource() => {
-                let Some(res) = world
-                    .resources
-                    .get_mut(&TypeId::of::<T>()) else {return};
-                res.downcast_mut::<ResourceTable<T>>()
-                    .expect("any to be ResourceTable<T>")
-                    .in_use = false;
-            }
+            TaskParameter::Resource() => world
+                .resources
+                .get(&TypeId::of::<T>())?
+                .get::<ResourceTable<T>>("any to be ResourceTable<T>")
+                .data
+                .get()
+                .some(),
         }
     }
 
     fn erase(self) -> TaskParameterDyn {
         match self {
             TaskParameter::Variable(v) => TaskParameterDyn::Variable(v.erase()),
-            TaskParameter::EventVar(e) => TaskParameterDyn::EventVar(e.erase()),
+            TaskParameter::Event() => TaskParameterDyn::Event(TypeId::of::<T>()),
             TaskParameter::Resource() => TaskParameterDyn::Resource(TypeId::of::<T>()),
         }
     }
@@ -426,9 +423,9 @@ impl<T: Component> From<Variable<T>> for TaskParameter<T> {
     }
 }
 
-impl<T: Component> From<EventVariable<T>> for TaskParameter<T> {
-    fn from(event_var: EventVariable<T>) -> Self {
-        Self::EventVar(event_var)
+impl<T: Component> From<EventValue<T>> for TaskParameter<T> {
+    fn from(_: EventValue<T>) -> Self {
+        Self::Event()
     }
 }
 
@@ -438,9 +435,25 @@ impl<T: Component> From<ResourceValue<T>> for TaskParameter<T> {
     }
 }
 
-impl<T: Component, F: Fn() -> ResourceValue<T>> From<F> for TaskParameter<T> {
+trait FnRetOverload<T> {
+    fn param() -> TaskParameter<T>;
+}
+
+impl<T: Component> FnRetOverload<T> for EventValue<T> {
+    fn param() -> TaskParameter<T> {
+        TaskParameter::Event()
+    }
+}
+
+impl<T: Component> FnRetOverload<T> for ResourceValue<T> {
+    fn param() -> TaskParameter<T> {
+        TaskParameter::Resource()
+    }
+}
+
+impl<T: Component, R: FnRetOverload<T>, F: Fn() -> R> From<F> for TaskParameter<T> {
     fn from(_: F) -> Self {
-        Self::Resource()
+        R::param()
     }
 }
 
@@ -460,14 +473,12 @@ impl<T> Clone for RefKindParameter<T> {
 
 struct TaskData<T> {
     index: usize,
-    generation: usize,
     _t: PhantomData<T>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct TaskDataDyn {
     index: usize,
-    generation: usize,
     tid: TypeId,
 }
 
@@ -476,7 +487,6 @@ impl TaskDataDyn {
         if self.tid == TypeId::of::<T>() {
             Some(TaskData {
                 index: self.index,
-                generation: self.generation,
                 _t: PhantomData::default(),
             })
         } else {
@@ -489,7 +499,6 @@ impl<T> Clone for TaskData<T> {
     fn clone(&self) -> Self {
         Self {
             index: self.index,
-            generation: self.generation,
             _t: PhantomData,
         }
     }
@@ -501,28 +510,28 @@ impl<T: Component> TaskData<T> {
     fn erase(self) -> TaskDataDyn {
         TaskDataDyn {
             index: self.index,
-            generation: self.generation,
             tid: TypeId::of::<T>(),
         }
     }
 }
 
 impl<T: Component + Clone> TaskData<T> {
-    fn get(self, world: &mut World) -> Option<T> {
-        let table = world
+    fn get(self, world: &World) -> Option<T> {
+        world
             .tasks
             .get(&TypeId::of::<T>())?
-            .downcast_ref::<TaskTable<T>>()
-            .expect("any to be TaskTable<T>");
-        let gen = *table.gen.get(self.index)?;
-        if gen != self.generation {
-            return None;
-        }
-        table.data.get(self.index).cloned()
+            .get::<TaskTable<T>>("any to be TaskTable<T>")
+            .data
+            .get(self.index)
+            .map(|cell| unsafe { &*cell.get() }.clone())
     }
 }
 
 pub trait RefKind<T: Component> {
+    /// casts the pointer to the right consumer type
+    /// # Safety
+    /// The pointer is generated with [`UnsafeCell::get`] and thus points to a valid value.
+    /// Usage still needs to enforce the exclusivity / shared property of references, depending what type of reference the implementor creates.
     unsafe fn from_ref(t: *mut T) -> Self;
     fn variant() -> RefKindVariant;
     fn variant_for<V>(param: TaskParameter<V>) -> RefKindParameter<V> {
@@ -599,11 +608,11 @@ impl TaskParam for () {
 }
 
 trait Call<Vars: TaskParam> {
-    fn call_from_world(self, a: TaskData<Vars::Vars>, world: &mut World);
+    fn call_from_world(self, a: TaskData<Vars::Vars>, world: &World);
 }
 
 impl Call<()> for fn() {
-    fn call_from_world(self, _a: TaskData<<() as TaskParam>::Vars>, _world: &mut World) {
+    fn call_from_world(self, _a: TaskData<<() as TaskParam>::Vars>, _world: &World) {
         (self)();
     }
 }
@@ -615,7 +624,7 @@ enum DynCommand<'a> {
 
 pub struct Task<Vars: TaskParam> {
     f: unsafe fn(),
-    dyn_caller: unsafe fn(DynCommand, TaskDataDyn, &mut World),
+    dyn_caller: unsafe fn(DynCommand, TaskDataDyn, &World),
     v: TaskData<Vars::Vars>,
 }
 
@@ -631,15 +640,15 @@ impl<Vars: TaskParam> Clone for Task<Vars> {
 
 impl<Vars: TaskParam> Copy for Task<Vars> {}
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TaskDyn {
     f: unsafe fn(),
-    dyn_caller: unsafe fn(DynCommand, TaskDataDyn, &mut World),
+    dyn_caller: unsafe fn(DynCommand, TaskDataDyn, &World),
     v: TaskDataDyn,
 }
 
 impl<T: TaskParam> Task<T> {
-    pub fn call_from_world(self, world: &mut World) {
+    pub fn call_from_world(self, world: &World) {
         unsafe {
             (self.dyn_caller)(DynCommand::Call(self.f), self.v.erase(), world);
         }
@@ -653,7 +662,7 @@ impl<T: TaskParam> Task<T> {
         }
     }
 
-    pub fn register_vars(&self, register: &mut dyn VariableRegister, world: &mut World) {
+    pub fn register_vars(&self, register: &mut dyn VariableRegister, world: &World) {
         unsafe {
             (self.dyn_caller)(DynCommand::ListVars(register), self.v.erase(), world);
         }
@@ -661,14 +670,14 @@ impl<T: TaskParam> Task<T> {
 }
 
 impl TaskDyn {
-    pub fn call_from_world(self, world: &mut World) {
+    pub fn call_from_world(self, world: &World) {
         unsafe {
             (self.dyn_caller)(DynCommand::Call(self.f), self.v, world);
         }
     }
 }
 
-unsafe fn call_from_world_dyn0(command: DynCommand, variables: TaskDataDyn, world: &mut World) {
+unsafe fn call_from_world_dyn0(command: DynCommand, variables: TaskDataDyn, world: &World) {
     let Some(exact_variables) = variables.downcast::<<() as TaskParam>::Vars>() else {eprintln!("unexpected typeid"); return};
     match command {
         DynCommand::Call(f) => {
@@ -682,7 +691,7 @@ unsafe fn call_from_world_dyn0(command: DynCommand, variables: TaskDataDyn, worl
 }
 
 impl Task<()> {
-    pub fn new0(f: fn(), world: &mut World) -> Self {
+    pub fn new0(f: fn(), world: &World) -> Self {
         Self {
             f: unsafe { std::mem::transmute(f) },
             dyn_caller: call_from_world_dyn0,
@@ -717,30 +726,20 @@ macro_rules! impl_call_from_world_dyn {
         }
 
         impl<$($t: Component, $r: RefKind<$t>),+> Call<($($t),+,)> for fn($($r),+) {
-            fn call_from_world(self, a: TaskData<<($($t),+,) as TaskParam>::Vars>, world: &mut World) {
+            fn call_from_world(self, a: TaskData<<($($t),+,) as TaskParam>::Vars>, world: &World
+    ) {
                 let Some(a) = a.get(world) else {return};
                 $(
                     let $f = a.$f.param.get_mut_ptr(world);
                 )+
-                let inner = |world: &mut World| {
+                $(
+                    let Some($f) = $f else {return;};
+                )+
+                (self)(
                     $(
-                        let Some($f) = $f else {return true};
-                    )+
-                    (self)(
-                        $(
-                            unsafe { $r::from_ref($f) }
-                        ),+
-                    );
-                    $(
-                        a.$f.param.reset_mut_ptr(world);
-                    )+
-                    return false;
-                };
-                if inner(world) {
-                    $(
-                        a.$f.param.reset_mut_ptr(world);
-                    )+
-                }
+                        unsafe { $r::from_ref($f) }
+                    ),+
+                );
             }
         }
 
@@ -748,7 +747,8 @@ macro_rules! impl_call_from_world_dyn {
         unsafe fn $fn_name<$($t: Component, $r: RefKind<$t>),+>(
             command: DynCommand,
             variables: TaskDataDyn,
-            world: &mut World,
+            world: &World
+    ,
         ) {
             let Some(exact_variables) = variables.downcast::<<($($t),+,) as TaskParam>::Vars>() else {eprintln!("unexpected typeid"); return};
             match command {
@@ -763,16 +763,33 @@ macro_rules! impl_call_from_world_dyn {
         }
 
         #[allow(dead_code)]
-        impl<$($t: Component),+> Task<($($t),+,)> {
-            pub fn $task_new<$($r: RefKind<$t>),+>(
+        impl World {
+            pub fn $task_new<$($t: Component, $r: RefKind<$t>),+>(
+                &self,
                 f: fn($($r),+),
                 $($v: impl Into<TaskParameter<$t>>,)+
-                world: &mut World,
-            ) -> Self {
-                Self {
+            ) -> Task<($($t),+,)> {
+                Task {
                     f: unsafe { std::mem::transmute(f) },
                     dyn_caller: $fn_name::<$($t, $r),+>,
-                    v: world.insert_task($task_param {
+                    v: self.insert_task($task_param {
+                        $($f: $r::variant_for($v.into()),)+
+                    }),
+                }
+            }
+        }
+
+        #[allow(dead_code)]
+        impl Spawner {
+            pub fn $task_new<$($t: Component, $r: RefKind<$t>),+>(
+                &self,
+                f: fn($($r),+),
+                $($v: impl Into<TaskParameter<$t>>,)+
+            ) -> Task<($($t),+,)> {
+                Task {
+                    f: unsafe { std::mem::transmute(f) },
+                    dyn_caller: $fn_name::<$($t, $r),+>,
+                    v: self.world.insert_task($task_param {
                         $($f: $r::variant_for($v.into()),)+
                     }),
                 }
@@ -781,6 +798,6 @@ macro_rules! impl_call_from_world_dyn {
     };
 }
 
-impl_call_from_world_dyn!(call_from_world_dyn1 -> new1 -> TaskParameters1 -> T0-R0-v0-f0);
-impl_call_from_world_dyn!(call_from_world_dyn2 -> new2 -> TaskParameters2 -> T0-R0-v0-f0, T1-R1-v1-f1);
-impl_call_from_world_dyn!(call_from_world_dyn3 -> new3 -> TaskParameters3 -> T0-R0-v0-f0, T1-R1-v1-f1, T2-R2-v2-f2);
+impl_call_from_world_dyn!(call_from_world_dyn1 -> task1 -> TaskParameters1 -> T0-R0-v0-f0);
+impl_call_from_world_dyn!(call_from_world_dyn2 -> task2 -> TaskParameters2 -> T0-R0-v0-f0, T1-R1-v1-f1);
+impl_call_from_world_dyn!(call_from_world_dyn3 -> task3 -> TaskParameters3 -> T0-R0-v0-f0, T1-R1-v1-f1, T2-R2-v2-f2);

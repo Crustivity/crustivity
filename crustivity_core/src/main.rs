@@ -5,45 +5,55 @@
  */
 
 use crustivity_core::{
-    spawner::Spawner,
-    Mut, Ref, Resource, Task, Variable, World,
+    constraints::ConstraintSystem, spawner::Spawner, Event, Mut, Ref, Resource, World,
 };
 
+use std::fmt::Write;
+
+struct Increment;
+
 fn main() {
-    let mut world = World::new();
-    {
-        let world = &mut world;
+    let world = World::new();
 
-
-        let a = Variable::new("42".to_string(), world);
-        let b = Variable::new(42, world);
-
-        fn inc_num(mut b: Mut<i32>) {
-            *b += 1;
-        }
-
-        fn format_num(mut s: Mut<String>, n: Ref<i32>) {
-            *s = n.to_string();
-        }
-
-        fn check() {
-            println!("Hello World");
-        }
-
-        let check = Task::new0(check, world).erase();
-        let inc_num = Task::new1(inc_num, b, world).erase();
-        let format_num = Task::new2(format_num, a, b, world);
-        let print = Task::new1(|s: Ref<_>| println!("{}", *s), a, world);
-
-        check.call_from_world(world);
-        print.call_from_world(world);
-        inc_num.call_from_world(world);
-        inc_num.call_from_world(world);
-        inc_num.call_from_world(world);
-    }
-    fn init(system: Ref<Spawner>) {
+    fn init(spawner: Ref<Spawner>, mut system: Mut<ConstraintSystem>) {
         println!("Init");
+
+        let my_str = spawner.variable("0".to_string());
+        let my_num = spawner.variable(0isize);
+
+        let num_to_str = spawner.task2(
+            |num: Ref<isize>, mut num_str: Mut<String>| {
+                // this is done in a stupid way, `*num_str = num.to_string()` would do it,
+                // but doing it this way shows that custivity does not relay on setting a new value like many other declarative framworks
+                num_str.clear();
+                write!(&mut *num_str, "{}", *num).unwrap();
+                println!("Convert");
+            },
+            my_num,
+            my_str,
+        );
+
+        let inc_event = spawner.task2(
+            |_: Ref<_>, mut num: Mut<_>| {
+                *num += 1;
+                println!("Increment");
+            },
+            Event::<Increment>,
+            my_num,
+        );
+
+        let print_num = spawner.task1(|num: Ref<_>| println!("num: {}", *num), my_num);
+        let print_str = spawner.task1(|s: Ref<_>| println!("str: {}", *s), my_str);
+
+        system.add_constraint(spawner.constraint(num_to_str));
+        system.add_constraint(spawner.constraint(inc_event));
+        system.add_effect(spawner.effect(print_num));
+        system.add_effect(spawner.effect(print_str));
+
+        spawner.emit_event(Increment);
+        spawner.emit_event(Increment);
     }
-    let init = Task::new1(init, Resource::<Spawner>, &mut world);
+
+    let init = world.task2(init, Resource::<Spawner>, Resource::<ConstraintSystem>);
     world.start(init.erase());
 }
