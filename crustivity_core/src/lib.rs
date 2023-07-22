@@ -409,9 +409,10 @@ impl World {
         }
     }
 
-    pub fn process_next_activation(&self) {
-        let Some(activation) = self.activations.lock().pop_front() else {return;};
+    pub fn process_next_activation(&self) -> bool {
+        let Some(activation) = self.activations.lock().pop_front() else {return false;};
         (activation.0)(self);
+        true
     }
 
     fn finish_effect<T: Component + Default>(&self) {
