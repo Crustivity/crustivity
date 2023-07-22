@@ -25,7 +25,7 @@ mod world;
 
 use crate::spawner::Spawner;
 pub use crate::world::World;
-use constraints::{ConstraintSystem, EffectPath};
+use constraints::{Constraint, ConstraintSystem, EffectPath};
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use sharded_slab::Slab;
@@ -72,6 +72,13 @@ struct EventTable<T> {
 
 unsafe impl<T: Send> Sync for EventTable<T> {}
 
+struct EffectTable<T> {
+    data: UnsafeCell<T>,
+    acivations: Mutex<Vec<T>>,
+}
+
+unsafe impl<T: Send> Sync for EffectTable<T> {}
+
 struct TaskTable<T> {
     data: Slab<UnsafeCell<T>>,
 }
@@ -96,6 +103,15 @@ impl<T> EventTable<T> {
             data: UnsafeCell::new(MaybeUninit::uninit()),
             has_data: AtomicBool::new(false),
             activations: Mutex::new(VecDeque::new()),
+        }
+    }
+}
+
+impl<T: Default> EffectTable<T> {
+    fn new() -> Self {
+        Self {
+            data: UnsafeCell::new(T::default()),
+            acivations: Mutex::new(Vec::new()),
         }
     }
 }
@@ -127,6 +143,12 @@ impl AnyType {
         }
     }
 
+    fn effect<T: Component + Default>() -> Self {
+        Self {
+            any: Box::new(EffectTable::<T>::new()) as Box<dyn Any + Send + Sync>,
+        }
+    }
+
     fn resource<T: Component>(t: T) -> Self {
         Self {
             any: Box::new(ResourceTable::new(t)) as Box<dyn Any + Send + Sync>,
@@ -144,31 +166,82 @@ impl AnyType {
     }
 }
 
-impl Default for World {
-    fn default() -> Self {
-        World::new()
+pub struct WorldBuilder {
+    world: World,
+}
+
+impl WorldBuilder {
+    pub fn new() -> Self {
+        Self {
+            world: World::new(),
+        }
+    }
+
+    pub fn build(self, system: ConstraintSystem) -> Arc<World> {
+        let world = Arc::new(self.world);
+        let spawner = Spawner::new(Arc::clone(&world));
+        world
+            .resource(spawner)
+            .ok()
+            .expect("Spawner to be inserted");
+        world
+            .resource(system)
+            .ok()
+            .expect("ConstraintSystem to be inserted");
+        world
+    }
+
+    pub fn variable<T: Component>(&self, t: T) -> Variable<T> {
+        self.world.variable(t)
+    }
+
+    pub fn resource<T: Component>(&self, t: T) -> Result<(), T> {
+        self.world.resource(t)
+    }
+
+    pub fn register_effect<T: Component + Default>(&self) {
+        self.world.register_effect::<T>()
+    }
+
+    pub fn register_event<T: Component>(&self, t: T) -> Result<(), T> {
+        self.world.register_event(t)
+    }
+
+    pub fn constraint<T: TaskParam>(&self, task: Task<T>) -> Constraint {
+        self.world.constraint(task)
     }
 }
 
 impl World {
-    pub fn new() -> Self {
-        World {
+    fn new() -> Self {
+        Self {
             vars: DashMap::new(),
             events: DashMap::new(),
+            effects: DashMap::new(),
             tasks: DashMap::new(),
             resources: DashMap::new(),
 
             activations: Mutex::new(VecDeque::new()),
+            insertion_lock: Mutex::new(()),
         }
     }
 
-    fn insert_var<T: Component>(&self, t: T) -> Variable<T> {
+    pub fn variable<T: Component>(&self, t: T) -> Variable<T> {
         let type_id = TypeId::of::<T>();
         let any = if let Some(any) = self.vars.get(&type_id) {
             any
         } else {
-            self.vars.insert(type_id, AnyType::variable::<T>());
-            self.vars.get(&type_id).unwrap()
+            let insertion_guard = self.insertion_lock.lock();
+            if let Some(any) = self.vars.get(&type_id) {
+                any
+            } else {
+                let previous = self.vars.insert(type_id, AnyType::variable::<T>());
+                drop(insertion_guard);
+                if previous.is_some() {
+                    log::warn!("Insertions of new tasks, that were already present, should not happen and may result in undefined behaviour.");
+                }
+                self.vars.get(&type_id).unwrap()
+            }
         };
         let table = any.get::<VarTable<T>>("any to be a VarTable<T>");
         Variable {
@@ -185,8 +258,17 @@ impl World {
         let any = if let Some(any) = self.tasks.get(&type_id) {
             any
         } else {
-            self.tasks.insert(type_id, AnyType::task::<T>());
-            self.tasks.get(&type_id).unwrap()
+            let insertion_guard = self.insertion_lock.lock();
+            if let Some(any) = self.tasks.get(&type_id) {
+                any
+            } else {
+                let previous = self.tasks.insert(type_id, AnyType::task::<T>());
+                drop(insertion_guard);
+                if previous.is_some() {
+                    log::warn!("Insertions of new tasks, that were already present, should not happen and may result in undefined behaviour.");
+                }
+                self.tasks.get(&type_id).unwrap()
+            }
         };
         let table = any.get::<TaskTable<T>>("any to be a TaskTable<T>");
         TaskData {
@@ -198,13 +280,22 @@ impl World {
         }
     }
 
-    pub fn insert_resource<T: Component>(&self, t: T) -> Result<(), T> {
+    pub fn resource<T: Component>(&self, t: T) -> Result<(), T> {
         let type_id = TypeId::of::<T>();
         if self.resources.contains_key(&type_id) {
             Err(t)
         } else {
-            _ = self.resources.insert(type_id, AnyType::resource(t));
-            Ok(())
+            let insertion_guard = self.insertion_lock.lock();
+            if self.resources.contains_key(&type_id) {
+                Err(t)
+            } else {
+                let previous = self.resources.insert(type_id, AnyType::resource(t));
+                drop(insertion_guard);
+                if previous.is_some() {
+                    log::warn!("Insertions of new resources, that were already present, should not happen and may result in undefined behaviour.");
+                }
+                Ok(())
+            }
         }
     }
 
@@ -217,23 +308,80 @@ impl World {
         task_vars.register_vars(register);
     }
 
-    fn emit_event<T: Component>(&self, t: T) {
+    pub fn register_effect<T: Component + Default>(&self) {
+        let type_id = TypeId::of::<T>();
+        if !self.effects.contains_key(&type_id) {
+            let insertion_guard = self.insertion_lock.lock();
+            if !self.effects.contains_key(&type_id) {
+                let previous = self
+                    .effects
+                    .insert(type_id, (AnyType::effect::<T>(), World::finish_effect::<T>));
+                drop(insertion_guard);
+                if previous.is_some() {
+                    log::warn!("Insertions of new effects, that were already present, should not happen and may result in undefined behaviour.");
+                }
+            }
+        }
+    }
+
+    pub fn receiv_effects<T: Component>(&self) -> Vec<T> {
+        let type_id = TypeId::of::<T>();
+        let Some(any) = self
+            .effects
+            .get(&type_id) else { return Vec::new();};
+        let effect = any.0.get::<EffectTable<T>>("any to be EffectTable<T>");
+        let mut activations = effect.acivations.lock();
+        std::mem::take(&mut *activations)
+    }
+
+    pub fn register_event<T: Component>(&self, t: T) -> Result<(), T> {
+        let type_id = TypeId::of::<T>();
+        if self.events.contains_key(&type_id) {
+            Err(t)
+        } else {
+            let insertion_guard = self.insertion_lock.lock();
+            if self.events.contains_key(&type_id) {
+                Err(t)
+            } else {
+                let previous = self.events.insert(type_id, AnyType::event::<T>());
+                let any = self.events.get(&type_id).unwrap();
+                let event = any.get::<EventTable<T>>("any to be an EventTable<T>");
+                let data_ptr = event.data.get();
+                let data_ref = unsafe { &mut *data_ptr };
+                data_ref.write(t);
+                event.has_data.store(true, Ordering::Release);
+                drop(insertion_guard);
+                if previous.is_some() {
+                    log::warn!("Insertions of new events, that were already present, should not happen and may result in undefined behaviour.");
+                }
+                Ok(())
+            }
+        }
+    }
+
+    pub fn emit_event<T: Component>(&self, t: T) {
         let type_id = TypeId::of::<T>();
         let any = if let Some(any) = self.events.get(&type_id) {
             any
         } else {
-            self.events.insert(type_id, AnyType::event::<T>());
-            self.events.get(&type_id).unwrap()
+            let insertion_guard = self.insertion_lock.lock();
+            if let Some(any) = self.events.get(&type_id) {
+                any
+            } else {
+                let previous = self.events.insert(type_id, AnyType::event::<T>());
+                drop(insertion_guard);
+                if previous.is_some() {
+                    log::warn!("Insertions of new events, that were already present, should not happen and may result in undefined behaviour.");
+                }
+                self.events.get(&type_id).unwrap()
+            }
         };
-        let event_table = any.get::<EventTable<T>>("any to be EventTable<T>");
+        let event_table = any.get::<EventTable<T>>("any to be an EventTable<T>");
         event_table.activations.lock().push_back(t);
 
         self.activations
             .lock()
             .push_back(ActivationEntry(World::write_activation_and_emit::<T>));
-
-        // TODO: use event structure
-        self.process_one_activation();
     }
 
     fn write_activation_and_emit<T: Component>(&self) {
@@ -250,7 +398,7 @@ impl World {
         data.write(activation_value);
         event.has_data.store(true, Ordering::Release);
 
-        let system = TaskParameter::<ConstraintSystem>::Resource()
+        let system = TaskParameter::<ConstraintSystem>::Resource
             .get_mut_ptr(self)
             .expect("ConstraintSystem to be an existing resource");
 
@@ -261,33 +409,38 @@ impl World {
         }
     }
 
-    fn process_one_activation(&self) {
+    pub fn process_next_activation(&self) {
         let Some(activation) = self.activations.lock().pop_front() else {return;};
         (activation.0)(self);
+    }
+
+    fn finish_effect<T: Component + Default>(&self) {
+        let type_id = TypeId::of::<T>();
+        let Some(any) = self.effects.get(&type_id) else {return;};
+        let effect = any.0.get::<EffectTable<T>>("any to be EffectTable<T>");
+        let data_ptr = effect.data.get();
+        // TODO: lock
+        let data_ref = unsafe { &mut *data_ptr };
+        let t = std::mem::take(data_ref);
+        effect.acivations.lock().push(t);
     }
 
     fn execute_effect_path(&self, path: EffectPath) {
         for entry in path.tasks {
             entry.call_from_world(self);
         }
-        for effect in path.effects {
-            effect.call_from_world(self);
+        for finisher in path
+            .effects
+            .iter()
+            .flat_map(|tid| self.effects.get(tid).into_iter())
+            .map(|any| any.1)
+        {
+            finisher(self);
         }
     }
 
-    pub fn start(self, f: TaskDyn) {
-        let world = Arc::new(self);
-        let spawner = Spawner::new(Arc::clone(&world));
-        let system = ConstraintSystem::new();
-        world
-            .insert_resource(spawner)
-            .ok()
-            .expect("Spawner to be inserted");
-        world
-            .insert_resource(system)
-            .ok()
-            .expect("ConstraintSystem to be inserted");
-        f.call_from_world(&world);
+    pub fn constraint<T: TaskParam>(&self, task: Task<T>) -> Constraint {
+        Constraint::new(task, self)
     }
 }
 
@@ -314,10 +467,6 @@ impl<T> Clone for Variable<T> {
 impl<T> Copy for Variable<T> {}
 
 impl<T: Component> Variable<T> {
-    pub fn new(t: T, world: &World) -> Self {
-        world.insert_var(t)
-    }
-
     fn erase(self) -> VariableDyn {
         VariableDyn {
             index: self.index,
@@ -330,6 +479,12 @@ pub struct EventValue<T>(PhantomData<T>);
 #[allow(non_snake_case)]
 pub fn Event<T: Component>() -> EventValue<T> {
     EventValue(PhantomData)
+}
+
+pub struct EffectValue<T>(PhantomData<T>);
+#[allow(non_snake_case)]
+pub fn Effect<T: Component>() -> EffectValue<T> {
+    EffectValue(PhantomData)
 }
 
 pub struct ResourceValue<T: Component>(PhantomData<T>);
@@ -346,14 +501,16 @@ pub enum RefKindVariant {
 
 pub enum TaskParameter<T> {
     Variable(Variable<T>),
-    Event(),
-    Resource(),
+    Event,
+    Effect,
+    Resource,
 }
 
 #[derive(Clone, Copy, PartialEq, PartialOrd, Ord, Eq, Hash)]
 pub enum TaskParameterDyn {
     Variable(VariableDyn),
     Event(TypeId),
+    Effect(TypeId),
     Resource(TypeId),
 }
 
@@ -362,6 +519,7 @@ impl std::fmt::Display for TaskParameterDyn {
         match self {
             TaskParameterDyn::Variable(v) => write!(f, "Var({})", v.index),
             TaskParameterDyn::Event(_) => write!(f, "Event()"),
+            TaskParameterDyn::Effect(_) => write!(f, "Effect()"),
             TaskParameterDyn::Resource(_) => write!(f, "Res()"),
         }
     }
@@ -371,8 +529,9 @@ impl<T> Clone for TaskParameter<T> {
     fn clone(&self) -> Self {
         match self {
             TaskParameter::Variable(v) => TaskParameter::Variable(*v),
-            TaskParameter::Event() => TaskParameter::Event(),
-            TaskParameter::Resource() => TaskParameter::Resource(),
+            TaskParameter::Event => TaskParameter::Event,
+            TaskParameter::Effect => TaskParameter::Effect,
+            TaskParameter::Resource => TaskParameter::Resource,
         }
     }
 }
@@ -381,16 +540,17 @@ impl<T> Copy for TaskParameter<T> {}
 
 impl<T: Component> TaskParameter<T> {
     fn get_mut_ptr(self, world: &World) -> Option<*mut T> {
+        let type_id = TypeId::of::<T>();
         match self {
             TaskParameter::Variable(v) => world
                 .vars
-                .get(&TypeId::of::<T>())?
+                .get(&type_id)?
                 .get::<VarTable<T>>("any to be VarTable<T>")
                 .data
                 .get(v.index)
                 .map(|cell| cell.get()),
-            TaskParameter::Event() => {
-                let any = world.events.get(&TypeId::of::<T>())?;
+            TaskParameter::Event => {
+                let any = world.events.get(&type_id)?;
                 let table = any.get::<EventTable<T>>("any to be EventTable<T>");
                 if table.has_data.load(Ordering::Acquire) {
                     table.data.get().inner_ptr().some()
@@ -398,9 +558,17 @@ impl<T: Component> TaskParameter<T> {
                     None
                 }
             }
-            TaskParameter::Resource() => world
+            TaskParameter::Effect => world
+                .effects
+                .get(&type_id)?
+                .0
+                .get::<EffectTable<T>>("any to be EffectTable<T>")
+                .data
+                .get()
+                .some(),
+            TaskParameter::Resource => world
                 .resources
-                .get(&TypeId::of::<T>())?
+                .get(&type_id)?
                 .get::<ResourceTable<T>>("any to be ResourceTable<T>")
                 .data
                 .get()
@@ -411,8 +579,9 @@ impl<T: Component> TaskParameter<T> {
     fn erase(self) -> TaskParameterDyn {
         match self {
             TaskParameter::Variable(v) => TaskParameterDyn::Variable(v.erase()),
-            TaskParameter::Event() => TaskParameterDyn::Event(TypeId::of::<T>()),
-            TaskParameter::Resource() => TaskParameterDyn::Resource(TypeId::of::<T>()),
+            TaskParameter::Event => TaskParameterDyn::Event(TypeId::of::<T>()),
+            TaskParameter::Effect => TaskParameterDyn::Effect(TypeId::of::<T>()),
+            TaskParameter::Resource => TaskParameterDyn::Resource(TypeId::of::<T>()),
         }
     }
 }
@@ -425,13 +594,19 @@ impl<T: Component> From<Variable<T>> for TaskParameter<T> {
 
 impl<T: Component> From<EventValue<T>> for TaskParameter<T> {
     fn from(_: EventValue<T>) -> Self {
-        Self::Event()
+        Self::Event
+    }
+}
+
+impl<T: Component> From<EffectValue<T>> for TaskParameter<T> {
+    fn from(_: EffectValue<T>) -> Self {
+        Self::Effect
     }
 }
 
 impl<T: Component> From<ResourceValue<T>> for TaskParameter<T> {
     fn from(_: ResourceValue<T>) -> Self {
-        Self::Resource()
+        Self::Resource
     }
 }
 
@@ -441,13 +616,19 @@ trait FnRetOverload<T> {
 
 impl<T: Component> FnRetOverload<T> for EventValue<T> {
     fn param() -> TaskParameter<T> {
-        TaskParameter::Event()
+        TaskParameter::Event
+    }
+}
+
+impl<T: Component> FnRetOverload<T> for EffectValue<T> {
+    fn param() -> TaskParameter<T> {
+        TaskParameter::Effect
     }
 }
 
 impl<T: Component> FnRetOverload<T> for ResourceValue<T> {
     fn param() -> TaskParameter<T> {
-        TaskParameter::Resource()
+        TaskParameter::Resource
     }
 }
 
@@ -781,6 +962,23 @@ macro_rules! impl_call_from_world_dyn {
 
         #[allow(dead_code)]
         impl Spawner {
+            pub fn $task_new<$($t: Component, $r: RefKind<$t>),+>(
+                &self,
+                f: fn($($r),+),
+                $($v: impl Into<TaskParameter<$t>>,)+
+            ) -> Task<($($t),+,)> {
+                Task {
+                    f: unsafe { std::mem::transmute(f) },
+                    dyn_caller: $fn_name::<$($t, $r),+>,
+                    v: self.world.insert_task($task_param {
+                        $($f: $r::variant_for($v.into()),)+
+                    }),
+                }
+            }
+        }
+
+        #[allow(dead_code)]
+        impl WorldBuilder {
             pub fn $task_new<$($t: Component, $r: RefKind<$t>),+>(
                 &self,
                 f: fn($($r),+),

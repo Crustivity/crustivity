@@ -5,7 +5,10 @@
  */
 
 use core::panic;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::{
+    any::TypeId,
+    collections::{HashMap, HashSet, VecDeque},
+};
 
 use crate::{
     Component, Task, TaskDyn, TaskParam, TaskParameter, TaskParameterDyn, VariableRegister, World,
@@ -149,72 +152,34 @@ impl Constraint {
     }
 }
 
-pub struct Effect {
-    task: TaskDyn,
-    params: HashSet<TaskParameterDyn>,
-}
-
-impl Effect {
-    pub fn new<T: TaskParam>(task: Task<T>, world: &World) -> Self {
-        let mut register = Register::default();
-        task.register_vars(&mut register, world);
-        if !register.1.is_empty() {
-            panic!("Effect cannot have out parameters");
-        }
-        Self {
-            task: task.erase(),
-            params: register.0,
-        }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-enum ConstraintTaskIndex {
-    Constraint(usize),
-    Effect(usize),
-}
-
 pub struct ConstraintSystem {
     constraints: Vec<Constraint>,
-    effects: Vec<TaskDyn>,
-    params_to_constraints_or_effect: HashMap<TaskParameterDyn, Vec<ConstraintTaskIndex>>,
+    params_to_constraints: HashMap<TaskParameterDyn, Vec<usize>>,
 }
 
 impl ConstraintSystem {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             constraints: Vec::new(),
-            effects: Vec::new(),
-            params_to_constraints_or_effect: HashMap::new(),
+            params_to_constraints: HashMap::new(),
         }
     }
 
     pub fn add_constraint(&mut self, constraint: Constraint) {
         let c_idx = self.constraints.len();
         for param in constraint.params.iter().copied() {
-            self.params_to_constraints_or_effect
+            self.params_to_constraints
                 .entry(param)
                 .or_insert_with(Vec::new)
-                .push(ConstraintTaskIndex::Constraint(c_idx));
+                .push(c_idx);
         }
         self.constraints.push(constraint);
-    }
-
-    pub fn add_effect(&mut self, effect: Effect) {
-        let e_idx = self.effects.len();
-        for param in effect.params {
-            self.params_to_constraints_or_effect
-                .entry(param)
-                .or_insert_with(Vec::new)
-                .push(ConstraintTaskIndex::Effect(e_idx));
-        }
-        self.effects.push(effect.task);
     }
 }
 
 pub(crate) struct EffectPath {
     pub(crate) tasks: Vec<TaskDyn>,
-    pub(crate) effects: Vec<TaskDyn>,
+    pub(crate) effects: HashSet<TypeId>,
 }
 
 impl EffectPath {
@@ -230,38 +195,30 @@ impl EffectPath {
         param: TaskParameterDyn,
         system: &ConstraintSystem,
     ) -> Option<Self> {
-        let mut effect_path = EffectPath {
-            tasks: Vec::new(),
-            effects: Vec::new(),
-        };
+        let mut tasks = Vec::new();
 
         let mut q = VecDeque::<TaskParameterDyn>::new();
         q.push_back(param);
 
-        let mut tasks = HashSet::new();
+        let mut task_set = HashSet::new();
         let mut effects = HashSet::new();
         while let Some(param) = q.pop_front() {
-            tasks.clear();
-            for &constrain_task_idx in system.params_to_constraints_or_effect.get(&param)? {
-                match constrain_task_idx {
-                    ConstraintTaskIndex::Constraint(c) => {
-                        if let Some((task, outs)) = system.constraints[c].choose_method(param) {
-                            q.extend(outs);
-                            tasks.insert(task);
-                        }
-                    }
-                    ConstraintTaskIndex::Effect(e) => {
-                        effects.insert(system.effects[e]);
-                    }
+            if let TaskParameterDyn::Effect(tid) = param {
+                effects.insert(tid);
+            }
+            task_set.clear();
+            for &c in system.params_to_constraints.get(&param)? {
+                if let Some((task, outs)) = system.constraints[c].choose_method(param) {
+                    q.extend(outs);
+                    task_set.insert(task);
                 }
             }
-            effect_path.tasks.extend(&tasks);
+            tasks.extend(&task_set);
         }
-        effect_path.effects.extend(effects.into_iter());
-        if effect_path.tasks.is_empty() && effect_path.effects.is_empty() {
+        if tasks.is_empty() {
             None
         } else {
-            Some(effect_path)
+            Some(EffectPath { tasks, effects })
         }
     }
 }

@@ -21,8 +21,10 @@ pub(crate) struct ActivationEntry(pub(crate) fn(world: &World));
 pub struct World {
     pub(crate) vars: DashMap<TypeId, AnyType>,
     pub(crate) events: DashMap<TypeId, AnyType>,
+    pub(crate) effects: DashMap<TypeId, (AnyType, fn(&World))>,
     pub(crate) tasks: DashMap<TypeId, AnyType>,
     pub(crate) resources: DashMap<TypeId, AnyType>,
 
     pub(crate) activations: Mutex<VecDeque<ActivationEntry>>,
+    pub(crate) insertion_lock: Mutex<()>,
 }

@@ -6,11 +6,7 @@
 
 use std::sync::Arc;
 
-use crate::{
-    constraints::{Constraint, Effect},
-    world::World,
-    Component, Task, TaskParam, Variable,
-};
+use crate::{constraints::Constraint, world::World, Component, Task, TaskParam, Variable};
 
 pub struct Spawner {
     pub(crate) world: Arc<World>,
@@ -22,7 +18,7 @@ impl Spawner {
     }
 
     pub fn variable<T: Component>(&self, t: T) -> Variable<T> {
-        self.world.insert_var(t)
+        self.world.variable(t)
     }
 
     pub fn emit_event<T: Component>(&self, t: T) {
@@ -30,14 +26,10 @@ impl Spawner {
     }
 
     pub fn resource<T: Component>(&self, t: T) -> Result<(), T> {
-        self.world.insert_resource(t)
+        self.world.resource(t)
     }
 
     pub fn constraint<T: TaskParam>(&self, task: Task<T>) -> Constraint {
         Constraint::new(task, &self.world)
-    }
-
-    pub fn effect<T: TaskParam>(&self, task: Task<T>) -> Effect {
-        Effect::new(task, &self.world)
     }
 }
