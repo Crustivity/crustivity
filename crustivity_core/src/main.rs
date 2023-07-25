@@ -4,7 +4,9 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-use crustivity_core::{constraints::ConstraintSystem, Effect, Event, Mut, Ref, WorldBuilder};
+use crustivity_core::{
+    constraints::ConstraintSystem, Effect, Event, Mut, Ref, WorldBuilder, WorldDataCreator,
+};
 
 use std::fmt::Write;
 
@@ -16,7 +18,7 @@ struct TestEffect(isize);
 fn main() {
     let world = WorldBuilder::new();
 
-    world.register_effect::<TestEffect>();
+    world.register_effect_named::<TestEffect>("TestEffect");
 
     let my_str = world.variable("0".to_string());
     let my_num = world.variable(0isize);
@@ -42,7 +44,8 @@ fn main() {
         my_num,
     );
 
-    let eff = world.task2(
+    let eff = world.task2_named(
+        "test_effect",
         |num: Ref<_>, mut eff: Mut<_>| {
             eff.0 = *num;
         },
@@ -52,9 +55,9 @@ fn main() {
 
     let mut system = ConstraintSystem::new();
 
-    system.add_constraint(world.constraint(num_to_str));
-    system.add_constraint(world.constraint(inc_event));
-    system.add_constraint(world.constraint(eff));
+    system.add_constraint(world.constraint(num_to_str).name("num_to_str"));
+    system.add_constraint(world.constraint(inc_event).name("inc_event"));
+    system.add_constraint(world.constraint(eff).name("eff"));
 
     let world = world.build(system);
 

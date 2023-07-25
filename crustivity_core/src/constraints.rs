@@ -7,11 +7,12 @@
 use core::panic;
 use std::{
     any::TypeId,
+    borrow::Cow,
     collections::{HashMap, HashSet, VecDeque},
 };
 
 use crate::{
-    Component, Task, TaskDyn, TaskParam, TaskParameter, TaskParameterDyn, VariableRegister, World,
+    Component, Task, TaskData, TaskDyn, TaskParameter, TaskParameterDyn, VariableRegister, World,
 };
 
 #[derive(Default)]
@@ -70,7 +71,10 @@ impl<T: Default + Clone> Vec2d<T> {
     }
 }
 
+pub type MethodChoser = fn(&Constraint, &[TaskParameterDyn]) -> Option<(TaskDyn, usize)>;
+
 pub struct Constraint {
+    name: Option<Cow<'static, str>>,
     tasks: Vec<TaskDyn>,
     params: Vec<TaskParameterDyn>,
 
@@ -78,12 +82,14 @@ pub struct Constraint {
     /// a row contains all status from one task (identified by its index)
     /// and a column refers to which task parameter the status belongs to
     param_status: Vec2d<TaskParameterStatus>,
+
+    choose_method_impl: MethodChoser,
 }
 
 impl Constraint {
-    pub fn new<T: TaskParam>(task: Task<T>, world: &World) -> Self {
+    pub fn new<T: TaskData>(task: Task<T>, world: &World) -> Self {
         let mut register = Register::default();
-        task.register_vars(&mut register, world);
+        world.register_vars(task, &mut register);
         if !register.0.is_disjoint(&register.1) {
             panic!("Input and output variables have to be disjoint");
         }
@@ -102,15 +108,31 @@ impl Constraint {
             .collect();
 
         Self {
+            name: None,
             tasks: vec![task.erase()],
             params,
             param_status,
+
+            choose_method_impl: |this, modified_params| {
+                let param = modified_params[0];
+                let pos = this.params.iter().position(|&p| p == param)?;
+                let chosen_row_idx = this
+                    .param_status
+                    .iter_column(pos)
+                    .position(|&s| s == TaskParameterStatus::In)?;
+                Some((this.tasks[chosen_row_idx], chosen_row_idx))
+            },
         }
     }
 
-    pub fn add_method<T: TaskParam>(mut self, task: Task<T>, world: &World) -> Self {
+    pub fn name(mut self, n: impl Into<Cow<'static, str>>) -> Self {
+        self.name = Some(n.into());
+        self
+    }
+
+    pub fn add_method<T: TaskData>(mut self, task: Task<T>, world: &World) -> Self {
         let mut register = Register::default();
-        task.register_vars(&mut register, world);
+        world.register_vars(task, &mut register);
         if !register.0.is_disjoint(&register.1) {
             panic!("Input and output variables have to be disjoint");
         }
@@ -131,27 +153,34 @@ impl Constraint {
         self
     }
 
-    fn choose_method(
+    pub fn overide_choose_method(mut self, choose_method_impl: MethodChoser) -> Self {
+        self.choose_method_impl = choose_method_impl;
+        self
+    }
+
+    fn out_parameter_for_task_idx(
         &self,
-        param: TaskParameterDyn,
-    ) -> Option<(TaskDyn, impl Iterator<Item = TaskParameterDyn> + '_)> {
-        let pos = self.params.iter().position(|&p| p == param)?;
-        let chosen_row_idx = self
-            .param_status
-            .iter_column(pos)
-            .position(|&s| s == TaskParameterStatus::In)?;
-        let out_parameter = self
-            .param_status
-            .row(chosen_row_idx)
+        idx: usize,
+    ) -> impl Iterator<Item = TaskParameterDyn> + '_ {
+        self.param_status
+            .row(idx)
             .iter()
             .enumerate()
             .filter(|&(_, s)| *s == TaskParameterStatus::Out)
             .map(|c_idx| c_idx.0)
-            .map(|c_idx| self.params[c_idx]);
-        Some((self.tasks[chosen_row_idx], out_parameter))
+            .map(|c_idx| self.params[c_idx])
+    }
+
+    fn choose_method(
+        &self,
+        param: &[TaskParameterDyn],
+    ) -> Option<(TaskDyn, impl Iterator<Item = TaskParameterDyn> + '_)> {
+        (self.choose_method_impl)(self, param)
+            .map(|(task, idx)| (task, self.out_parameter_for_task_idx(idx)))
     }
 }
 
+#[derive(Default)]
 pub struct ConstraintSystem {
     constraints: Vec<Constraint>,
     params_to_constraints: HashMap<TaskParameterDyn, Vec<usize>>,
@@ -159,10 +188,7 @@ pub struct ConstraintSystem {
 
 impl ConstraintSystem {
     pub fn new() -> Self {
-        Self {
-            constraints: Vec::new(),
-            params_to_constraints: HashMap::new(),
-        }
+        Self::default()
     }
 
     pub fn add_constraint(&mut self, constraint: Constraint) {
@@ -208,7 +234,7 @@ impl EffectPath {
             }
             task_set.clear();
             for &c in system.params_to_constraints.get(&param)? {
-                if let Some((task, outs)) = system.constraints[c].choose_method(param) {
+                if let Some((task, outs)) = system.constraints[c].choose_method(&[param]) {
                     q.extend(outs);
                     task_set.insert(task);
                 }

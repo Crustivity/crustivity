@@ -4,9 +4,11 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-use std::sync::Arc;
+use std::{borrow::Cow, sync::Arc};
 
-use crate::{constraints::Constraint, world::World, Component, Task, TaskParam, Variable};
+use crate::{
+    constraints::Constraint, world::World, Component, Task, TaskData, Variable, WorldDataCreator,
+};
 
 pub struct Spawner {
     pub(crate) world: Arc<World>,
@@ -17,19 +19,57 @@ impl Spawner {
         Self { world }
     }
 
-    pub fn variable<T: Component>(&self, t: T) -> Variable<T> {
-        self.world.variable(t)
-    }
-
     pub fn emit_event<T: Component>(&self, t: T) {
         self.world.emit_event(t)
     }
+}
 
-    pub fn resource<T: Component>(&self, t: T) -> Result<(), T> {
+impl WorldDataCreator for Spawner {
+    fn variable<T: Component>(&self, t: T) -> Variable<T> {
+        self.world.variable(t)
+    }
+
+    fn variable_named<T: Component>(
+        &self,
+        t: T,
+        name: impl Into<Cow<'static, str>>,
+    ) -> Variable<T> {
+        self.world.variable_named(t, name)
+    }
+
+    fn resource<T: Component>(&self, t: T) -> Result<(), T> {
         self.world.resource(t)
     }
 
-    pub fn constraint<T: TaskParam>(&self, task: Task<T>) -> Constraint {
+    fn resource_named<T: Component>(
+        &self,
+        t: T,
+        name: impl Into<Cow<'static, str>>,
+    ) -> Result<(), T> {
+        self.world.resource_named(t, name)
+    }
+
+    fn constraint<T: TaskData>(&self, task: Task<T>) -> Constraint {
         Constraint::new(task, &self.world)
+    }
+
+    fn register_effect<T: Component + Default>(&self) {
+        self.world.register_effect::<T>()
+    }
+
+    fn register_effect_named<T: Component + Default>(&self, name: impl Into<Cow<'static, str>>) {
+        self.world.register_effect_named::<T>(name)
+    }
+
+    fn register_event<T: Component>(&self, t: T) -> Result<(), T> {
+        self.world.register_event(t)
+    }
+
+    fn register_event_named<T: Component>(
+        &self,
+        t: T,
+        name: impl Into<Cow<'static, str>>,
+    ) -> Result<(), T> {
+        self.world.register_event_named(t, name)
     }
 }

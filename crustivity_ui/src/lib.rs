@@ -4,16 +4,11 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-use std::{borrow::Cow, sync::Arc};
+use std::sync::Arc;
 
-use crustivity_core::World;
+use crustivity_core::{World, WorldDataCreator};
 use interaction::Init;
-use vello::{
-    kurbo::Affine,
-    peniko::{Color, Fill},
-    util::RenderContext,
-    RendererOptions, Scene, SceneBuilder,
-};
+use vello::{peniko::Color, util::RenderContext, RendererOptions, Scene};
 use winit::{
     dpi::{PhysicalPosition, PhysicalSize},
     event::{ElementState, Event, MouseButton, WindowEvent},
@@ -28,7 +23,7 @@ use crate::interaction::MouseClick;
 pub mod interaction;
 
 pub fn run(world: Arc<World>) {
-    world.register_effect::<Scene>();
+    world.register_effect_named::<Scene>("Scene");
 
     let event_loop = EventLoop::<()>::new();
 
@@ -50,7 +45,7 @@ pub fn run(world: Arc<World>) {
             &device_handle.device,
             &RendererOptions {
                 surface_format: Some(surface.format),
-                timestamp_period: (&device_handle.queue).get_timestamp_period(),
+                timestamp_period: device_handle.queue.get_timestamp_period(),
             },
         )
         .unwrap()
