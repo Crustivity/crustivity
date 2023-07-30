@@ -13,7 +13,7 @@ use std::{
     mem::MaybeUninit,
     ops::{Deref, DerefMut},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
 };
@@ -31,10 +31,11 @@ pub use crate::world::{
     Component, Task, TaskData, TaskDyn, TaskParameter, TaskParameterDyn, Variable, VariableDyn,
     World,
 };
-use constraints::{Constraint, ConstraintSystem, EffectPath};
+use constraints::{ConstraintBuilder, System};
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use sharded_slab::Slab;
+use world::DynVarResult;
 
 trait MaybeUninitPtrTransmut {
     type Inner;
@@ -60,9 +61,14 @@ impl<T: Sized> ToSome for T {
     }
 }
 
+trait DataTable {
+    fn err_msg() -> String;
+}
+
 struct VarEntry<T> {
     t: UnsafeCell<T>,
     name: Option<Cow<'static, str>>,
+    last_write: AtomicU64,
 }
 
 struct VarTable<T> {
@@ -110,6 +116,12 @@ impl<T> VarTable<T> {
     }
 }
 
+impl<T> DataTable for VarTable<T> {
+    fn err_msg() -> String {
+        format!("any to be VarTable<{}>", std::any::type_name::<T>())
+    }
+}
+
 impl<T> EventTable<T> {
     fn new() -> Self {
         Self {
@@ -117,6 +129,12 @@ impl<T> EventTable<T> {
             has_data: AtomicBool::new(false),
             activations: Mutex::new(VecDeque::new()),
         }
+    }
+}
+
+impl<T> DataTable for EventTable<T> {
+    fn err_msg() -> String {
+        format!("any to be EventTable<{}>", std::any::type_name::<T>())
     }
 }
 
@@ -129,9 +147,21 @@ impl<T: Default> EffectTable<T> {
     }
 }
 
+impl<T> DataTable for EffectTable<T> {
+    fn err_msg() -> String {
+        format!("any to be EffectTable<{}>", std::any::type_name::<T>())
+    }
+}
+
 impl<T> TaskTable<T> {
     fn new() -> Self {
         Self { data: Slab::new() }
+    }
+}
+
+impl<T> DataTable for TaskTable<T> {
+    fn err_msg() -> String {
+        format!("any to be TaskTable<{}>", std::any::type_name::<T>())
     }
 }
 
@@ -143,12 +173,21 @@ impl<T> ResourceTable<T> {
     }
 }
 
-fn variable_call_dyn<T: Component>(command: DynVarCommand, var: VariableDyn, world: &World) {
-    let Some(var) = var.downcast::<T>() else {return;};
+impl<T> DataTable for ResourceTable<T> {
+    fn err_msg() -> String {
+        format!("any to be ResourceTable<{}>", std::any::type_name::<T>())
+    }
+}
+
+fn variable_call_dyn<T: Component>(
+    command: DynVarCommand,
+    var: VariableDyn,
+    world: &World,
+) -> DynVarResult {
+    let var = var.downcast::<T>().unwrap();
     match command {
-        DynVarCommand::GetName(ret_name) => {
-            ret_name(world.variable_name(var));
-        }
+        DynVarCommand::GetName => DynVarResult::Name(world.variable_name(var)),
+        DynVarCommand::GetLastWrite => DynVarResult::LastWrite(world.variable_last_write(var)),
     }
 }
 
@@ -171,29 +210,32 @@ impl AnyTask {
 }
 
 impl AnyEvent {
-    fn new<T: Component>(name: Option<Cow<'static, str>>) -> Self {
+    fn new<T: Component>(last_write: u64, name: Option<Cow<'static, str>>) -> Self {
         Self {
             any: AnyType::new(EventTable::<T>::new()),
             name,
+            last_write: AtomicU64::new(last_write),
         }
     }
 }
 
 impl AnyEffect {
-    fn new<T: Component + Default>(name: Option<Cow<'static, str>>) -> Self {
+    fn new<T: Component + Default>(last_write: u64, name: Option<Cow<'static, str>>) -> Self {
         Self {
             any: AnyType::new(EffectTable::<T>::new()),
             name,
             finisher: World::finish_effect::<T>,
+            last_write: AtomicU64::new(last_write),
         }
     }
 }
 
 impl AnyResource {
-    fn new<T: Component>(t: T, name: Option<Cow<'static, str>>) -> Self {
+    fn new<T: Component>(last_write: u64, t: T, name: Option<Cow<'static, str>>) -> Self {
         Self {
             any: AnyType::new(ResourceTable::new(t)),
             name,
+            last_write: AtomicU64::new(last_write),
         }
     }
 }
@@ -203,8 +245,11 @@ impl AnyType {
         Self(Box::new(any) as Box<dyn Any + Send + Sync>)
     }
 
-    fn get<TTable: Send + 'static>(&self, err_msg: &'static str) -> &TTable {
-        self.0.downcast_ref::<TTable>().expect(err_msg)
+    fn get<TTable: DataTable + Send + 'static>(&self) -> &TTable {
+        match self.0.downcast_ref::<TTable>() {
+            Some(t) => t,
+            None => panic!("failed downcast, expected {}", TTable::err_msg()),
+        }
     }
 }
 
@@ -239,7 +284,7 @@ pub trait WorldDataCreator {
         name: impl Into<Cow<'static, str>>,
     ) -> Result<(), T>;
 
-    fn constraint<T: TaskData>(&self, task: Task<T>) -> Constraint;
+    fn constraint<T: TaskData>(&self, task: Task<T>) -> ConstraintBuilder;
 }
 
 pub trait WorldNameAccess {
@@ -257,6 +302,26 @@ pub trait WorldNameAccess {
 
     fn resource_name<T: Component>(&self) -> Option<Cow<'static, str>>;
     fn resource_name_dyn(&self, resource: TypeId) -> Option<Cow<'static, str>>;
+
+    fn task_parameter_name<T: Component>(
+        &self,
+        param: TaskParameter<T>,
+    ) -> Option<Cow<'static, str>> {
+        match param {
+            TaskParameter::Variable(v) => self.variable_name(v),
+            TaskParameter::Event => self.event_name::<T>(),
+            TaskParameter::Effect => self.effect_name::<T>(),
+            TaskParameter::Resource => self.resource_name::<T>(),
+        }
+    }
+    fn task_parameter_name_dyn(&self, param: TaskParameterDyn) -> Option<Cow<'static, str>> {
+        match param {
+            TaskParameterDyn::Variable(v) => self.variable_name_dyn(v),
+            TaskParameterDyn::Event(e) => self.event_name_dyn(e),
+            TaskParameterDyn::Effect(e) => self.effect_name_dyn(e),
+            TaskParameterDyn::Resource(r) => self.resource_name_dyn(r),
+        }
+    }
 }
 
 impl WorldBuilder {
@@ -264,7 +329,7 @@ impl WorldBuilder {
         Self::default()
     }
 
-    pub fn build(self, system: ConstraintSystem) -> Arc<World> {
+    pub fn build(self, system: System) -> Arc<World> {
         let world = Arc::new(self.world);
         let spawner = Spawner::new(Arc::clone(&world));
         world
@@ -324,7 +389,7 @@ impl WorldDataCreator for WorldBuilder {
         self.world.register_event_named(t, name)
     }
 
-    fn constraint<T: TaskData>(&self, task: Task<T>) -> Constraint {
+    fn constraint<T: TaskData>(&self, task: Task<T>) -> ConstraintBuilder {
         self.world.constraint(task)
     }
 }
@@ -389,13 +454,14 @@ impl World {
                 self.vars.get(&type_id).unwrap()
             }
         };
-        let table = any.any.get::<VarTable<T>>("any to be a VarTable<T>");
+        let table = any.any.get::<VarTable<T>>();
         Variable {
             index: table
                 .data
                 .insert(VarEntry {
                     t: UnsafeCell::new(t),
                     name,
+                    last_write: AtomicU64::new(self.last_write.fetch_add(1, Ordering::Relaxed)),
                 })
                 .expect("out of memory"),
             _t: PhantomData,
@@ -403,12 +469,16 @@ impl World {
     }
 
     pub fn register_vars<T: TaskData>(&self, task: Task<T>, register: &mut dyn VariableRegister) {
-        let Some(task) = self.task_fn(task).map(|(_, t)| t) else {return};
+        let Some(task) = self.task_fn(task).map(|(_, t)| t) else {
+            return;
+        };
         task.register_vars(register);
     }
 
     pub fn register_vars_dyn(&self, task: TaskDyn, register: &mut dyn VariableRegister) {
-        let Some(any) = self.tasks.get(&task.tid) else {return;};
+        let Some(any) = self.tasks.get(&task.tid) else {
+            return;
+        };
         (any.dyn_caller)(DynTaskCommand::ListVars(register), task, self);
     }
 
@@ -435,9 +505,7 @@ impl World {
                 self.tasks.get(&type_id).unwrap()
             }
         };
-        let table = any
-            .any
-            .get::<TaskTable<T::Vars>>("any to be a TaskTable<T>");
+        let table = any.any.get::<TaskTable<T::Vars>>();
         Task {
             index: table
                 .data
@@ -456,7 +524,7 @@ impl World {
         self.tasks
             .get(&type_id)?
             .any
-            .get::<TaskTable<T::Vars>>("any to be TaskTable<T::Vars>")
+            .get::<TaskTable<T::Vars>>()
             .data
             .get(task.index)
             .map(|cell| (cell.f, Clone::clone(unsafe { &*cell.t.get() })))
@@ -464,12 +532,16 @@ impl World {
 
     pub fn task_call<T: TaskData>(&self, task: Task<T>) {
         let type_id = TypeId::of::<T>();
-        let Some(any) = self.tasks.get(&type_id) else {return;};
+        let Some(any) = self.tasks.get(&type_id) else {
+            return;
+        };
         (any.dyn_caller)(DynTaskCommand::Call, task.erase(), self);
     }
 
     fn task_call_dyn(&self, task: TaskDyn) {
-        let Some(any) = self.tasks.get(&task.tid) else {return;};
+        let Some(any) = self.tasks.get(&task.tid) else {
+            return;
+        };
         (any.dyn_caller)(DynTaskCommand::Call, task, self);
     }
 
@@ -486,7 +558,10 @@ impl World {
             if self.resources.contains_key(&type_id) {
                 Err(t)
             } else {
-                let previous = self.resources.insert(type_id, AnyResource::new(t, name));
+                let previous = self.resources.insert(
+                    type_id,
+                    AnyResource::new(self.last_write.fetch_add(1, Ordering::Relaxed), t, name),
+                );
                 drop(insertion_guard);
                 if previous.is_some() {
                     log::warn!("Insertions of new resources, that were already present, should not happen and may result in undefined behaviour.");
@@ -501,7 +576,10 @@ impl World {
         if !self.effects.contains_key(&type_id) {
             let insertion_guard = self.insertion_lock.lock();
             if !self.effects.contains_key(&type_id) {
-                let previous = self.effects.insert(type_id, AnyEffect::new::<T>(name));
+                let previous = self.effects.insert(
+                    type_id,
+                    AnyEffect::new::<T>(self.last_write.fetch_add(1, Ordering::Relaxed), name),
+                );
                 drop(insertion_guard);
                 if previous.is_some() {
                     log::warn!("Insertions of new effects, that were already present, should not happen and may result in undefined behaviour.");
@@ -512,10 +590,10 @@ impl World {
 
     pub fn receiv_effects<T: Component>(&self) -> Vec<T> {
         let type_id = TypeId::of::<T>();
-        let Some(any) = self
-            .effects
-            .get(&type_id) else { return Vec::new();};
-        let effect = any.any.get::<EffectTable<T>>("any to be EffectTable<T>");
+        let Some(any) = self.effects.get(&type_id) else {
+            return Vec::new();
+        };
+        let effect = any.any.get::<EffectTable<T>>();
         let mut activations = effect.acivations.lock();
         std::mem::take(&mut *activations)
     }
@@ -529,9 +607,12 @@ impl World {
             if self.events.contains_key(&type_id) {
                 Err(t)
             } else {
-                let previous = self.events.insert(type_id, AnyEvent::new::<T>(name));
+                let previous = self.events.insert(
+                    type_id,
+                    AnyEvent::new::<T>(self.last_write.fetch_add(1, Ordering::Relaxed), name),
+                );
                 let any = self.events.get(&type_id).unwrap();
-                let event = any.any.get::<EventTable<T>>("any to be an EventTable<T>");
+                let event = any.any.get::<EventTable<T>>();
                 let data_ptr = event.data.get();
                 let data_ref = unsafe { &mut *data_ptr };
                 data_ref.write(t);
@@ -554,7 +635,10 @@ impl World {
             if let Some(any) = self.events.get(&type_id) {
                 any
             } else {
-                let previous = self.events.insert(type_id, AnyEvent::new::<T>(None));
+                let previous = self.events.insert(
+                    type_id,
+                    AnyEvent::new::<T>(self.last_write.fetch_add(1, Ordering::Relaxed), None),
+                );
                 drop(insertion_guard);
                 if previous.is_some() {
                     log::warn!("Insertions of new events, that were already present, should not happen and may result in undefined behaviour.");
@@ -562,7 +646,7 @@ impl World {
                 self.events.get(&type_id).unwrap()
             }
         };
-        let event_table = any.any.get::<EventTable<T>>("any to be an EventTable<T>");
+        let event_table = any.any.get::<EventTable<T>>();
         event_table.activations.lock().push_back(t);
 
         self.activations
@@ -572,9 +656,13 @@ impl World {
 
     fn write_activation_and_emit<T: Component>(&self) {
         let type_id = TypeId::of::<T>();
-        let Some(any) = self.events.get(&type_id) else {return;};
-        let event = any.any.get::<EventTable<T>>("any to be EventTable<T>");
-        let Some(activation_value) = event.activations.lock().pop_front() else {return;};
+        let Some(any) = self.events.get(&type_id) else {
+            return;
+        };
+        let event = any.any.get::<EventTable<T>>();
+        let Some(activation_value) = event.activations.lock().pop_front() else {
+            return;
+        };
         let data = event.data.get();
         // SAFETY: TODO: needs lock for concurrent usage
         let data = unsafe { &mut *data };
@@ -584,27 +672,31 @@ impl World {
         data.write(activation_value);
         event.has_data.store(true, Ordering::Release);
 
-        let system = TaskParameter::<ConstraintSystem>::Resource
+        let system = TaskParameter::<System>::Resource
             .get_mut_ptr(self)
             .expect("ConstraintSystem to be an existing resource");
 
         // SAFETY: TODO: needs lock for concurrent usage
-        let system = unsafe { &*system };
-        if let Some(path) = EffectPath::starting_with(Event::<T>, system) {
-            self.execute_effect_path(path);
-        }
+        let _system = unsafe { &*system };
+        // if let Some(path) = EffectPath::starting_with(Event::<T>, system, self) {
+        //     self.execute_effect_path(path);
+        // }
     }
 
     pub fn process_next_activation(&self) -> bool {
-        let Some(activation) = self.activations.lock().pop_front() else {return false;};
+        let Some(activation) = self.activations.lock().pop_front() else {
+            return false;
+        };
         (activation.0)(self);
         true
     }
 
     fn finish_effect<T: Component + Default>(&self) {
         let type_id = TypeId::of::<T>();
-        let Some(any) = self.effects.get(&type_id) else {return;};
-        let effect = any.any.get::<EffectTable<T>>("any to be EffectTable<T>");
+        let Some(any) = self.effects.get(&type_id) else {
+            return;
+        };
+        let effect = any.any.get::<EffectTable<T>>();
         let data_ptr = effect.data.get();
         // TODO: lock
         let data_ref = unsafe { &mut *data_ptr };
@@ -612,17 +704,108 @@ impl World {
         effect.acivations.lock().push(t);
     }
 
-    fn execute_effect_path(&self, path: EffectPath) {
-        for entry in path.tasks {
-            self.task_call_dyn(entry);
+    // fn execute_effect_path(&self, path: EffectPath) {
+    //     for entry in path.tasks {
+    //         self.task_call_dyn(entry);
+    //     }
+    //     for finisher in path
+    //         .effects
+    //         .iter()
+    //         .flat_map(|tid| self.effects.get(tid).into_iter())
+    //         .map(|any| any.finisher)
+    //     {
+    //         finisher(self);
+    //     }
+    // }
+
+    fn touch_task_param<T: Component>(&self, param: TaskParameter<T>) {
+        let type_id = TypeId::of::<T>();
+        match param {
+            TaskParameter::Variable(v) => {
+                let Some(any) = self.vars.get(&type_id) else {
+                    return;
+                };
+                let Some(data) = any.any.get::<VarTable<T>>().data.get(v.index) else {
+                    return;
+                };
+                data.last_write.store(
+                    self.last_write.fetch_add(1, Ordering::Relaxed),
+                    Ordering::Relaxed,
+                );
+            }
+            TaskParameter::Event => {
+                let Some(any) = self.events.get(&type_id) else {
+                    return;
+                };
+                any.last_write.store(
+                    self.last_write.fetch_add(1, Ordering::Relaxed),
+                    Ordering::Relaxed,
+                );
+            }
+            TaskParameter::Effect => {
+                let Some(any) = self.effects.get(&type_id) else {
+                    return;
+                };
+                any.last_write.store(
+                    self.last_write.fetch_add(1, Ordering::Relaxed),
+                    Ordering::Relaxed,
+                );
+            }
+            TaskParameter::Resource => {
+                let Some(any) = self.events.get(&type_id) else {
+                    return;
+                };
+                any.last_write.store(
+                    self.last_write.fetch_add(1, Ordering::Relaxed),
+                    Ordering::Relaxed,
+                );
+            }
         }
-        for finisher in path
-            .effects
-            .iter()
-            .flat_map(|tid| self.effects.get(tid).into_iter())
-            .map(|any| any.finisher)
-        {
-            finisher(self);
+    }
+
+    fn variable_last_write<T: Component>(&self, var: Variable<T>) -> Option<u64> {
+        let type_id = TypeId::of::<T>();
+        self.vars
+            .get(&type_id)?
+            .any
+            .get::<VarTable<T>>()
+            .data
+            .get(var.index)?
+            .last_write
+            .load(Ordering::Relaxed)
+            .some()
+    }
+
+    fn task_param_last_write_dyn(&self, param: TaskParameterDyn) -> Option<u64> {
+        match param {
+            TaskParameterDyn::Variable(v) => {
+                let any = self.vars.get(&v.tid)?;
+                if let DynVarResult::LastWrite(last_write) =
+                    (any.dyn_caller)(DynVarCommand::GetLastWrite, v, self)
+                {
+                    last_write
+                } else {
+                    unreachable!()
+                }
+            }
+            TaskParameterDyn::Event(e) => self
+                .events
+                .get(&e)?
+                .last_write
+                .load(Ordering::Relaxed)
+                .some(),
+            TaskParameterDyn::Effect(e) => self
+                .effects
+                .get(&e)?
+                .last_write
+                .load(Ordering::Relaxed)
+                .some(),
+            TaskParameterDyn::Resource(r) => self
+                .events
+                .get(&r)?
+                .last_write
+                .load(Ordering::Relaxed)
+                .some(),
         }
     }
 }
@@ -639,6 +822,8 @@ impl Default for World {
 
             activations: Mutex::new(VecDeque::new()),
             insertion_lock: Mutex::new(()),
+
+            last_write: AtomicU64::new(0),
         }
     }
 }
@@ -688,8 +873,8 @@ impl WorldDataCreator for World {
         self.insert_event(t, name.into().some())
     }
 
-    fn constraint<T: TaskData>(&self, task: Task<T>) -> Constraint {
-        Constraint::new(task, self)
+    fn constraint<T: TaskData>(&self, task: Task<T>) -> ConstraintBuilder {
+        ConstraintBuilder::new(task, self)
     }
 }
 
@@ -699,7 +884,7 @@ impl WorldNameAccess for World {
         self.vars
             .get(&type_id)?
             .any
-            .get::<VarTable<T>>("any to be VarTable<T>")
+            .get::<VarTable<T>>()
             .data
             .get(var.index)?
             .name
@@ -708,9 +893,11 @@ impl WorldNameAccess for World {
 
     fn variable_name_dyn(&self, var: VariableDyn) -> Option<Cow<'static, str>> {
         let dyn_caller = self.vars.get(&var.tid)?.dyn_caller;
-        let mut name = None;
-        dyn_caller(DynVarCommand::GetName(&mut |n| name = n), var, self);
-        name
+        if let DynVarResult::Name(name) = dyn_caller(DynVarCommand::GetName, var, self) {
+            name
+        } else {
+            unreachable!()
+        }
     }
 
     fn task_name<T: TaskData>(&self, task: Task<T>) -> Option<Cow<'static, str>> {
@@ -718,7 +905,7 @@ impl WorldNameAccess for World {
         self.tasks
             .get(&type_id)?
             .any
-            .get::<TaskTable<T::Vars>>("any to be TaskTable<T>")
+            .get::<TaskTable<T::Vars>>()
             .data
             .get(task.index)?
             .name
@@ -761,7 +948,7 @@ impl WorldNameAccess for World {
 }
 
 impl<T: Component> Variable<T> {
-    fn erase(self) -> VariableDyn {
+    pub fn erase(self) -> VariableDyn {
         VariableDyn {
             index: self.index,
             tid: TypeId::of::<T>(),
@@ -832,13 +1019,13 @@ impl<T: Component> TaskParameter<T> {
                 .vars
                 .get(&type_id)?
                 .any
-                .get::<VarTable<T>>("any to be VarTable<T>")
+                .get::<VarTable<T>>()
                 .data
                 .get(v.index)
                 .map(|cell| cell.t.get()),
             TaskParameter::Event => {
                 let any = world.events.get(&type_id)?;
-                let table = any.any.get::<EventTable<T>>("any to be EventTable<T>");
+                let table = any.any.get::<EventTable<T>>();
                 if table.has_data.load(Ordering::Acquire) {
                     table.data.get().inner_ptr().some()
                 } else {
@@ -849,7 +1036,7 @@ impl<T: Component> TaskParameter<T> {
                 .effects
                 .get(&type_id)?
                 .any
-                .get::<EffectTable<T>>("any to be EffectTable<T>")
+                .get::<EffectTable<T>>()
                 .data
                 .get()
                 .some(),
@@ -857,14 +1044,14 @@ impl<T: Component> TaskParameter<T> {
                 .resources
                 .get(&type_id)?
                 .any
-                .get::<ResourceTable<T>>("any to be ResourceTable<T>")
+                .get::<ResourceTable<T>>()
                 .data
                 .get()
                 .some(),
         }
     }
 
-    fn erase(self) -> TaskParameterDyn {
+    pub fn erase(self) -> TaskParameterDyn {
         match self {
             TaskParameter::Variable(v) => TaskParameterDyn::Variable(v.erase()),
             TaskParameter::Event => TaskParameterDyn::Event(TypeId::of::<T>()),
@@ -898,29 +1085,77 @@ impl<T: Component> From<ResourceValue<T>> for TaskParameter<T> {
     }
 }
 
-trait FnRetOverload<T> {
-    fn param() -> TaskParameter<T>;
+impl<T: Component> From<Variable<T>> for TaskParameterDyn {
+    fn from(variable: Variable<T>) -> Self {
+        Self::Variable(variable.erase())
+    }
 }
 
-impl<T: Component> FnRetOverload<T> for EventValue<T> {
+impl<T: Component> From<EventValue<T>> for TaskParameterDyn {
+    fn from(_: EventValue<T>) -> Self {
+        Self::Event(TypeId::of::<T>())
+    }
+}
+
+impl<T: Component> From<EffectValue<T>> for TaskParameterDyn {
+    fn from(_: EffectValue<T>) -> Self {
+        Self::Effect(TypeId::of::<T>())
+    }
+}
+
+impl<T: Component> From<ResourceValue<T>> for TaskParameterDyn {
+    fn from(_: ResourceValue<T>) -> Self {
+        Self::Resource(TypeId::of::<T>())
+    }
+}
+
+trait FnRetOverload<T> {
+    fn param() -> T;
+}
+
+impl<T: Component> FnRetOverload<TaskParameter<T>> for EventValue<T> {
     fn param() -> TaskParameter<T> {
         TaskParameter::Event
     }
 }
 
-impl<T: Component> FnRetOverload<T> for EffectValue<T> {
+impl<T: Component> FnRetOverload<TaskParameter<T>> for EffectValue<T> {
     fn param() -> TaskParameter<T> {
         TaskParameter::Effect
     }
 }
 
-impl<T: Component> FnRetOverload<T> for ResourceValue<T> {
+impl<T: Component> FnRetOverload<TaskParameter<T>> for ResourceValue<T> {
     fn param() -> TaskParameter<T> {
         TaskParameter::Resource
     }
 }
 
-impl<T: Component, R: FnRetOverload<T>, F: Fn() -> R> From<F> for TaskParameter<T> {
+impl<T: Component, R: FnRetOverload<TaskParameter<T>>, F: Fn() -> R> From<F> for TaskParameter<T> {
+    fn from(_: F) -> Self {
+        R::param()
+    }
+}
+
+impl<T: Component> FnRetOverload<TaskParameterDyn> for EventValue<T> {
+    fn param() -> TaskParameterDyn {
+        TaskParameterDyn::Event(TypeId::of::<T>())
+    }
+}
+
+impl<T: Component> FnRetOverload<TaskParameterDyn> for EffectValue<T> {
+    fn param() -> TaskParameterDyn {
+        TaskParameterDyn::Effect(TypeId::of::<T>())
+    }
+}
+
+impl<T: Component> FnRetOverload<TaskParameterDyn> for ResourceValue<T> {
+    fn param() -> TaskParameterDyn {
+        TaskParameterDyn::Resource(TypeId::of::<T>())
+    }
+}
+
+impl<R: FnRetOverload<TaskParameterDyn>, F: Fn() -> R> From<F> for TaskParameterDyn {
     fn from(_: F) -> Self {
         R::param()
     }
@@ -1056,10 +1291,7 @@ macro_rules! impl_call_from_world_dyn {
                 DynTaskCommand::Call => {
                     let Some((f, a)) = world.task_fn(task) else {return};
                     $(
-                        let $f = a.$f.param.get_mut_ptr(world);
-                    )+
-                    $(
-                        let Some($f) = $f else {return;};
+                        let Some($f) = a.$f.param.get_mut_ptr(world) else {return;};
                     )+
                     let f: fn($($r),+) = unsafe { std::mem::transmute(f) };
                     (f)(
@@ -1067,6 +1299,11 @@ macro_rules! impl_call_from_world_dyn {
                             unsafe { $r::from_ref($f) }
                         ),+
                     );
+                    $(
+                        if $r::variant() == RefKindVariant::Mut {
+                            world.touch_task_param(a.$f.param);
+                        }
+                    )+
                 },
                 DynTaskCommand::ListVars(register) => {
                     world.register_vars(task, register);
@@ -1180,6 +1417,7 @@ macro_rules! impl_call_from_world_dyn {
     };
 }
 
-impl_call_from_world_dyn!(call_from_world_dyn1 -> task1,task1_named -> TaskParameters1 -> T0-R0-v0-f0);
-impl_call_from_world_dyn!(call_from_world_dyn2 -> task2,task2_named -> TaskParameters2 -> T0-R0-v0-f0, T1-R1-v1-f1);
-impl_call_from_world_dyn!(call_from_world_dyn3 -> task3,task3_named -> TaskParameters3 -> T0-R0-v0-f0, T1-R1-v1-f1, T2-R2-v2-f2);
+impl_call_from_world_dyn!(call_from_world_dyn1 -> task1,task1_named -> TaskParameters1 -> T1-R1-v1-f1);
+impl_call_from_world_dyn!(call_from_world_dyn2 -> task2,task2_named -> TaskParameters2 -> T1-R1-v1-f1, T2-R2-v2-f2);
+impl_call_from_world_dyn!(call_from_world_dyn3 -> task3,task3_named -> TaskParameters3 -> T1-R1-v1-f1, T2-R2-v2-f2, T3-R3-v3-f3);
+impl_call_from_world_dyn!(call_from_world_dyn4 -> task4,task4_named -> TaskParameters4 -> T1-R1-v1-f1, T2-R2-v2-f2, T3-R3-v3-f3, T4-R4-v4-f4);

@@ -7,7 +7,8 @@
 use std::{borrow::Cow, sync::Arc};
 
 use crate::{
-    constraints::Constraint, world::World, Component, Task, TaskData, Variable, WorldDataCreator,
+    constraints::ConstraintBuilder, world::World, Component, Task, TaskData, Variable,
+    WorldDataCreator,
 };
 
 pub struct Spawner {
@@ -49,8 +50,8 @@ impl WorldDataCreator for Spawner {
         self.world.resource_named(t, name)
     }
 
-    fn constraint<T: TaskData>(&self, task: Task<T>) -> Constraint {
-        Constraint::new(task, &self.world)
+    fn constraint<T: TaskData>(&self, task: Task<T>) -> ConstraintBuilder {
+        self.world.constraint(task)
     }
 
     fn register_effect<T: Component + Default>(&self) {
