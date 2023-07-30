@@ -392,4 +392,132 @@ impl System {
             v.strength = Some(strength);
         }
     }
+
+    pub fn planner(&self) -> Planner {
+        let mut unsatisfied_cns = self
+            .constraints
+            .keys()
+            .filter(|&c_ref| self.constraints[c_ref].selected_method.is_none())
+            .collect::<HashSet<_>>();
+        let mut free_variables = self
+            .vars
+            .iter()
+            .filter(|&(_, v)| v.num_constraints == 1 || v.strength.is_some())
+            .filter(|&(_, v)| v.constraints.iter().any(|c| unsatisfied_cns.contains(c)))
+            .map(|(r, _)| *r)
+            .collect::<Vec<_>>();
+        let mut unenforced_cns = BinaryHeap::<ConstraintRef>::new();
+        Planner {
+            system: self.clone(),
+            unsatisfied_cns,
+            free_variables,
+            unenforced_cns,
+        }
+    }
+}
+
+impl Planner {
+    pub fn write_graphvis(&self, world: &impl WorldNameAccess, out: impl Into<Cow<'static, str>>) {
+        self.system.write_graphvis(world, out)
+    }
+    pub fn set_strength(&mut self, strength: u32, param: TaskParameterDyn) {
+        if let Some(v) = self.system.vars.get_mut(&param) {
+            v.strength = Some(strength);
+        }
+    }
+    pub fn multi_output_planner(&mut self) {
+        let Planner {
+            system,
+            unsatisfied_cns,
+            free_variables,
+            unenforced_cns,
+        } = self;
+        while let Some(free_var) = free_variables.pop() {
+            if unsatisfied_cns.len() == 0 {
+                break;
+            }
+
+            let free_var = &system.vars[&free_var];
+            if free_var.num_constraints == 1 || free_var.strength.is_some() {
+                let Some(cn) = free_var
+                    .constraints
+                    .iter()
+                    .copied()
+                    .find(|c| unsatisfied_cns.contains(c))
+                else {
+                    continue;
+                };
+                let constraint = &mut system.constraints[cn];
+                if let Some((m_idx, outputs)) = constraint.methods.find_outs(|outputs| {
+                    let (all_one, max_strength) = outputs
+                        .iter()
+                        .map(|o| &system.vars[o])
+                        .map(|v| (v.num_constraints, v.strength))
+                        .fold(
+                            (true, None),
+                            |(all_one, max_strength), (num_cn, strength)| {
+                                (all_one && num_cn == 1, max_strength.max(strength))
+                            },
+                        );
+                    if all_one {
+                        Some(u32::MAX)
+                    } else {
+                        println!("{max_strength:?}");
+                        max_strength
+                    }
+                }) {
+                    constraint.selected_method = Some(m_idx);
+                    for output in outputs {
+                        system.vars.get_mut(output).unwrap().determined_by = Some(cn);
+                    }
+                    for var in &system.constraints[cn].variables {
+                        let v = system.vars.get_mut(var).unwrap();
+                        v.num_constraints -= 1;
+                        if v.num_constraints == 1 || v.strength.is_some() {
+                            free_variables.push(*var);
+                        }
+                    }
+                    unsatisfied_cns.remove(&cn);
+                }
+            }
+        }
+        if !unsatisfied_cns.is_empty() {
+            // forward prune
+        }
+    }
+
+    fn constraint_hierarchy_planner(&mut self, ceiling_strength: u32) {
+        self.multi_output_planner();
+        while let Some(&c_ref) = self
+            .unsatisfied_cns
+            .iter()
+            .min_by_key(|&&c_ref| self.system.constraints[c_ref].strength)
+        {
+            let cn = &mut self.system.constraints[c_ref];
+            if cn.strength >= ceiling_strength {
+                break;
+            }
+            self.unsatisfied_cns.remove(&c_ref);
+            self.unenforced_cns.push(c_ref);
+            if let Some(selected) = cn.selected_method {
+                for param in cn.methods.outputs_at(selected) {
+                    self.system.vars.get_mut(param).unwrap().determined_by = None;
+                }
+            }
+            cn.selected_method = None;
+            for v_idx in &cn.variables {
+                let v = self.system.vars.get_mut(v_idx).unwrap();
+                v.num_constraints -= 1;
+                if v.num_constraints == 1 {
+                    self.free_variables.push(*v_idx);
+                }
+            }
+            self.multi_output_planner();
+        }
+    }
+
+    pub fn constraint_hierarchy_solver(&mut self) {
+        self.constraint_hierarchy_planner(u32::MAX);
+        if !self.unsatisfied_cns.is_empty() {}
+    }
 }

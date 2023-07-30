@@ -121,5 +121,10 @@ fn main() {
 
     system.write_graphvis(&world, "pre.svg");
 
+    let mut planner = system.planner();
+    planner.multi_output_planner();
+
+    planner.write_graphvis(&world, "test.svg");
+
     let world = world.build(system);
 }
