@@ -9,6 +9,7 @@ use std::{
     borrow::Cow,
     collections::VecDeque,
     marker::PhantomData,
+    sync::atomic::AtomicU64,
 };
 
 use dashmap::DashMap;
@@ -43,13 +44,19 @@ pub struct VariableDyn {
     pub(crate) tid: TypeId,
 }
 
-pub(crate) enum DynVarCommand<'a> {
-    GetName(&'a mut dyn FnMut(Option<Cow<'static, str>>)),
+pub(crate) enum DynVarCommand {
+    GetName,
+    GetLastWrite,
+}
+
+pub(crate) enum DynVarResult {
+    Name(Option<Cow<'static, str>>),
+    LastWrite(Option<u64>),
 }
 
 pub(crate) struct AnyVar {
     pub(crate) any: AnyType,
-    pub(crate) dyn_caller: fn(DynVarCommand, VariableDyn, &World),
+    pub(crate) dyn_caller: fn(DynVarCommand, VariableDyn, &World) -> DynVarResult,
 }
 
 pub trait TaskDataInternal: Clone + Component {
@@ -121,17 +128,20 @@ pub(crate) struct AnyTask {
 pub(crate) struct AnyEvent {
     pub(crate) any: AnyType,
     pub(crate) name: Option<Cow<'static, str>>,
+    pub(crate) last_write: AtomicU64,
 }
 
 pub(crate) struct AnyEffect {
     pub(crate) any: AnyType,
     pub(crate) name: Option<Cow<'static, str>>,
     pub(crate) finisher: fn(&World),
+    pub(crate) last_write: AtomicU64,
 }
 
 pub(crate) struct AnyResource {
     pub(crate) any: AnyType,
     pub(crate) name: Option<Cow<'static, str>>,
+    pub(crate) last_write: AtomicU64,
 }
 
 pub struct World {
@@ -144,4 +154,6 @@ pub struct World {
 
     pub(crate) activations: Mutex<VecDeque<ActivationEntry>>,
     pub(crate) insertion_lock: Mutex<()>,
+
+    pub(crate) last_write: AtomicU64,
 }
