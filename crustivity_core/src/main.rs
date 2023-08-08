@@ -120,6 +120,10 @@ fn main() {
     system.add_constraint(world.constraint(print_nums).name("print"));
 
     system.write_graphvis(&world, "pre.svg");
+    system.plan_with_event(Event::<IncrementT>);
+    system.write_graphvis(&world, "post.svg");
+    system.plan_with_event(Event::<IncrementH>);
+    system.write_graphvis(&world, "post-2.svg");
 
     let world = world.build(system);
 }

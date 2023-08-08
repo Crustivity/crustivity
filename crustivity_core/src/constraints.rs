@@ -9,7 +9,7 @@ use std::{
     borrow::Cow,
     collections::{
         hash_map::{DefaultHasher, Entry},
-        BinaryHeap, HashMap, HashSet,
+        HashMap, HashSet, VecDeque,
     },
     hash::{Hash, Hasher},
 };
@@ -41,79 +41,19 @@ struct Method {
 }
 
 #[derive(Clone)]
-enum Methods {
-    Real(Vec<Method>),
-    Synthetic(TaskParameterDyn),
-}
-
-impl Methods {
-    fn real(method: Method) -> Self {
-        Self::Real(vec![method])
-    }
-
-    fn push_real(&mut self, method: Method) {
-        if let Methods::Real(m) = self {
-            m.push(method);
-        }
-    }
-
-    fn len(&self) -> usize {
-        match self {
-            Methods::Real(v) => v.len(),
-            Methods::Synthetic(_) => 1,
-        }
-    }
-
-    fn outputs_at(&self, idx: usize) -> &[TaskParameterDyn] {
-        match self {
-            Methods::Real(v) => &v[idx].outputs,
-            Methods::Synthetic(s) => std::slice::from_ref(s),
-        }
-    }
-
-    fn find_outs(
-        &self,
-        mut predicate: impl FnMut(&[TaskParameterDyn]) -> Option<u32>,
-    ) -> Option<(usize, &[TaskParameterDyn])> {
-        match self {
-            Methods::Real(v) => {
-                if v.len() == 1 {
-                    Some((0, v[0].outputs.as_slice()))
-                } else {
-                    v.iter()
-                        .enumerate()
-                        .filter_map(|(i, m)| predicate(&m.outputs).map(|strength| (i, m, strength)))
-                        .map(|(idx, outs, strength)| (idx, outs.outputs.as_slice(), strength))
-                        .max_by_key(|(_, _, strength)| *strength)
-                        .map(|(idx, outs, _)| (idx, outs))
-                }
-            }
-
-            Methods::Synthetic(s) => {
-                predicate(std::slice::from_ref(s)).map(|_| (0, std::slice::from_ref(s)))
-            }
-        }
-    }
-}
-
-#[derive(Clone)]
 struct Variable {
-    determined_by: Option<ConstraintRef>,
-    constraints: Vec<ConstraintRef>,
-    num_constraints: usize,
-    mark: bool,
+    constraints: HashSet<ConstraintRef>,
+    strength: i32,
     value: TaskParameterDyn,
-    strength: Option<u32>,
 }
 
 #[derive(Clone)]
 pub(crate) struct Constraint {
     name: Option<Cow<'static, str>>,
     variables: HashSet<TaskParameterDyn>,
-    methods: Methods,
+    methods: Vec<Method>,
     selected_method: Option<usize>,
-    strength: u32,
-    mark: bool,
+    last_input: Option<TaskParameterDyn>,
 }
 
 slotmap::new_key_type! {
@@ -131,11 +71,12 @@ pub struct ConstraintBuilder<'a> {
     world: &'a World,
 }
 
-pub struct Planner {
-    system: System,
-    unsatisfied_cns: HashSet<ConstraintRef>,
-    free_variables: Vec<TaskParameterDyn>,
-    unenforced_cns: BinaryHeap<ConstraintRef>,
+trait MethodChooser {
+    fn choose_method(
+        &self,
+        input: TaskParameterDyn,
+        strength_from: impl Fn(&TaskParameterDyn) -> i32 + Copy,
+    ) -> usize;
 }
 
 impl<'a> ConstraintBuilder<'a> {
@@ -161,10 +102,9 @@ impl<'a> ConstraintBuilder<'a> {
             constraint: Constraint {
                 name: None,
                 variables: all_vars,
-                methods: Methods::real(method),
+                methods: vec![method],
                 selected_method: None,
-                strength: u32::MAX,
-                mark: false,
+                last_input: None,
             },
             world,
         }
@@ -187,7 +127,7 @@ impl<'a> ConstraintBuilder<'a> {
             panic!("Method has different TaskParameters than the constraint.");
         }
 
-        self.constraint.methods.push_real(Method {
+        self.constraint.methods.push(Method {
             task: task.erase(),
             outputs: register.outs.into_iter().collect(),
             inputs: register.ins.into_iter().collect(),
@@ -202,41 +142,6 @@ impl<'a> ConstraintBuilder<'a> {
 }
 
 impl System {
-    pub fn add_stay_constraint(&mut self, param: TaskParameterDyn) {
-        let constraint = Constraint {
-            name: Some(Cow::Borrowed("Strong stay")),
-            variables: {
-                let mut s = HashSet::new();
-                s.insert(param);
-                s
-            },
-            methods: Methods::Synthetic(param),
-            selected_method: None,
-            strength: 0,
-            mark: false,
-        };
-        let c_ref = self.constraints.insert(constraint);
-        match self.vars.entry(param) {
-            Entry::Occupied(mut o) => {
-                let var = o.get_mut();
-                if !var.constraints.contains(&c_ref) {
-                    var.constraints.push(c_ref);
-                    var.num_constraints += 1;
-                }
-            }
-            Entry::Vacant(v) => {
-                v.insert(Variable {
-                    determined_by: None,
-                    constraints: vec![c_ref],
-                    num_constraints: 1,
-                    strength: None,
-                    mark: false,
-                    value: param,
-                });
-            }
-        }
-    }
-
     pub fn add_constraint(&mut self, mut constraint: ConstraintBuilder) {
         let is_simple = constraint.constraint.methods.len() == 1;
         if is_simple {
@@ -249,20 +154,15 @@ impl System {
             match self.vars.entry(param) {
                 Entry::Occupied(mut o) => {
                     let var = o.get_mut();
-                    if !var.constraints.contains(&constraint_ref) {
-                        var.constraints.push(constraint_ref);
-                        if !is_simple {
-                            var.num_constraints += 1;
-                        }
+                    var.constraints.insert(constraint_ref);
+                    if !is_simple {
+                        var.strength += 1;
                     }
                 }
                 Entry::Vacant(v) => {
                     v.insert(Variable {
-                        determined_by: None,
-                        constraints: vec![constraint_ref],
-                        num_constraints: if is_simple { 0 } else { 1 },
-                        strength: None,
-                        mark: false,
+                        constraints: HashSet::from([constraint_ref]),
+                        strength: if is_simple { 0 } else { 1 },
                         value: param,
                     });
                 }
@@ -283,43 +183,30 @@ impl System {
 
             let mut sub = Vec::new();
             let middle_point_idx = c.methods.len() / 2;
-            match &c.methods {
-                Methods::Real(m) => {
-                    for (t_idx, task) in m.iter().enumerate() {
-                        let id = if t_idx == middle_point_idx {
-                            format!("t_{c_idx}_point")
-                        } else {
-                            format!("t_{c_idx}_{t_idx}")
-                        };
-                        if let Some(name) = world
-                            .task_name_dyn(task.task)
-                            .as_ref()
-                            .map(|n| format!("\"{n}\""))
-                        {
-                            sub.push(stmt!(
-                                node!(id; attr!("shape", "hexagon"), attr!("label", name))
-                            ));
-                        } else {
-                            sub.push(stmt!(node!(id; attr!("shape", "hexagon"))));
-                        }
-                    }
-
-                    if let Some(name) = c.name.as_ref().map(|n| format!("\"{n}\"")) {
-                        sub.push(stmt!(attr!("label", name)));
-                    }
-                    let sub = Subgraph {
-                        id: id!(cluster_id),
-                        stmts: sub,
-                    };
-                    dot.add_stmt(stmt!(sub));
-                }
-                Methods::Synthetic(s) => {
-                    let id = format!("t_{c_idx}_point");
-                    dot.add_stmt(stmt!(
-                        node!(id; attr!("label", "\"strong stay\""), attr!("shape", "box"))
-                    ));
-                }
+            for (t_idx, task) in c.methods.iter().enumerate() {
+                let id = if t_idx == middle_point_idx {
+                    format!("t_{c_idx}_point")
+                } else {
+                    format!("t_{c_idx}_{t_idx}")
+                };
+                let name = world
+                    .task_name_dyn(task.task)
+                    .as_ref()
+                    .map(|n| format!("\"{n} ({t_idx})\""))
+                    .unwrap_or_else(|| format!("\"<Unknown> ({t_idx})\""));
+                sub.push(stmt!(
+                    node!(id; attr!("shape", "hexagon"), attr!("label", name))
+                ));
             }
+
+            if let Some(name) = c.name.as_ref().map(|n| format!("\"{n}\"")) {
+                sub.push(stmt!(attr!("label", name)));
+            }
+            let sub = Subgraph {
+                id: id!(cluster_id),
+                stmts: sub,
+            };
+            dot.add_stmt(stmt!(sub));
         }
 
         for (v_idx, var) in self.vars.iter() {
@@ -332,17 +219,14 @@ impl System {
             let mut hasher = DefaultHasher::new();
             v_idx.hash(&mut hasher);
             let id = format!("v_{}", hasher.finish());
-            if let Some(name) = world
+            let name = world
                 .task_parameter_name_dyn(var.value)
                 .as_ref()
-                .map(|n| format!("\"{n}\""))
-            {
-                dot.add_stmt(stmt!(
-                    node!(id; attr!("shape", "oval"), style, attr!("label", name))
-                ));
-            } else {
-                dot.add_stmt(stmt!(node!(id; attr!("shape", "oval"), style)));
-            }
+                .map(|n| format!("\"{n} ({})\"", var.strength))
+                .unwrap_or_else(|| format!("\"<Unknown> ({})\"", var.strength));
+            dot.add_stmt(stmt!(
+                node!(id; attr!("shape", "oval"), style, attr!("label", name))
+            ));
 
             for cn in &var.constraints {
                 let constraint = &self.constraints[*cn];
@@ -355,10 +239,14 @@ impl System {
                         } else {
                             format!("t_{c_idx}_{t_idx}")
                         };
-                        let edge = if constraint.methods.outputs_at(t_idx).contains(&var.value) {
-                            edge!(node_id!(point_id) => node_id!(id); attr!("dir", "forward"), attr!("arrowhead", "normal"))
+                        let stroke_attr = match constraint.last_input {
+                            Some(p) if p == *v_idx => attr!("style", "bold"),
+                            _ => attr!("style", "normal"),
+                        };
+                        let edge = if constraint.methods[t_idx].outputs.contains(&var.value) {
+                            edge!(node_id!(point_id) => node_id!(id); attr!("dir", "forward"), attr!("arrowhead", "normal"), stroke_attr)
                         } else {
-                            edge!(node_id!(id) => node_id!(point_id); attr!("dir", "forward"), attr!("arrowhead", "normal"))
+                            edge!(node_id!(id) => node_id!(point_id); attr!("dir", "forward"), attr!("arrowhead", "normal"), stroke_attr)
                         };
                         dot.add_stmt(stmt!(edge));
                     }
@@ -375,7 +263,6 @@ impl System {
 
         let mut ctx = PrinterContext::default();
         let dot_str = graphviz_rust::print(dot, &mut ctx);
-        println!("{dot_str}");
         let _empty = graphviz_rust::exec_dot(
             dot_str,
             vec![
@@ -387,9 +274,84 @@ impl System {
         .unwrap();
     }
 
-    pub fn set_strength(&mut self, strength: u32, param: TaskParameterDyn) {
-        if let Some(v) = self.vars.get_mut(&param) {
-            v.strength = Some(strength);
+    pub fn plan_with_event(&mut self, event: impl Into<TaskParameterDyn>) {
+        let event = event.into();
+        let mut q = VecDeque::new();
+        q.push_back(event);
+        let mut visited_params = HashSet::new();
+        let mut visited_constraints = HashSet::new();
+        while let Some(var) = q.pop_front() {
+            for c_ref in self.vars[&var]
+                .constraints
+                .clone()
+                .into_iter()
+                .filter(|&c_ref| visited_constraints.insert(c_ref))
+            {
+                let constraint = &mut self.constraints[c_ref];
+                if constraint.methods.len() == 1 {
+                    debug_assert!(constraint.selected_method.is_some());
+                    for &out in &constraint.methods[0].outputs {
+                        if visited_params.insert(out) {
+                            q.push_back(out);
+                        }
+                    }
+                    continue;
+                }
+                let selected_m = constraint
+                    .methods
+                    .choose_method(var, |p| self.vars[p].strength);
+
+                // reset from previous selected method
+                if let Some(previous_selected_method_idx) = constraint.selected_method {
+                    let method = &constraint.methods[previous_selected_method_idx];
+                    for input in method
+                        .inputs
+                        .iter()
+                        .filter(|&&param| Some(param) != constraint.last_input)
+                    {
+                        self.vars.get_mut(input).unwrap().strength += 1;
+                    }
+                    for output in method.outputs.iter() {
+                        self.vars.get_mut(output).unwrap().strength -= 1;
+                    }
+                }
+
+                let method = &constraint.methods[selected_m];
+
+                for input in method.inputs.iter().filter(|&&param| param != var) {
+                    self.vars.get_mut(input).unwrap().strength -= 1;
+                }
+                for output in &method.outputs {
+                    self.vars.get_mut(output).unwrap().strength += 1;
+                    if visited_params.insert(*output) {
+                        q.push_back(*output);
+                    }
+                }
+                constraint.last_input = Some(var);
+                constraint.selected_method = Some(selected_m);
+            }
         }
+    }
+}
+
+impl MethodChooser for Vec<Method> {
+    fn choose_method(
+        &self,
+        input: TaskParameterDyn,
+        strength_from: impl Fn(&TaskParameterDyn) -> i32 + Copy,
+    ) -> usize {
+        self.iter()
+            .enumerate()
+            .filter(|&(_, m)| m.inputs.contains(&input))
+            .map(|(idx, m)| {
+                (
+                    idx,
+                    m.inputs.iter().map(strength_from).sum::<i32>()
+                        - m.outputs.iter().map(strength_from).sum::<i32>(),
+                )
+            })
+            .max_by_key(|(_, score)| *score)
+            .map(|(m, _)| m)
+            .unwrap()
     }
 }
