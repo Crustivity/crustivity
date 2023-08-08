@@ -29,10 +29,7 @@ pub struct Variable<T> {
 
 impl<T> Clone for Variable<T> {
     fn clone(&self) -> Self {
-        Self {
-            index: self.index,
-            _t: PhantomData,
-        }
+        *self
     }
 }
 
@@ -74,10 +71,7 @@ pub struct Task<D: TaskData> {
 
 impl<D: TaskData> Clone for Task<D> {
     fn clone(&self) -> Self {
-        Self {
-            index: self.index,
-            _t: PhantomData,
-        }
+        *self
     }
 }
 

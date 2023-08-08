@@ -515,7 +515,7 @@ impl World {
                     name,
                 })
                 .expect("out of memory"),
-            _t: PhantomData::default(),
+            _t: PhantomData,
         }
     }
 
@@ -961,7 +961,7 @@ impl VariableDyn {
         if self.tid == TypeId::of::<T>() {
             Some(Variable {
                 index: self.index,
-                _t: PhantomData::default(),
+                _t: PhantomData,
             })
         } else {
             None
@@ -1000,12 +1000,7 @@ impl std::fmt::Display for TaskParameterDyn {
 
 impl<T> Clone for TaskParameter<T> {
     fn clone(&self) -> Self {
-        match self {
-            TaskParameter::Variable(v) => TaskParameter::Variable(*v),
-            TaskParameter::Event => TaskParameter::Event,
-            TaskParameter::Effect => TaskParameter::Effect,
-            TaskParameter::Resource => TaskParameter::Resource,
-        }
+        *self
     }
 }
 
@@ -1180,7 +1175,7 @@ impl TaskDyn {
         if self.tid == TypeId::of::<T>() {
             Some(Task {
                 index: self.index,
-                _t: PhantomData::default(),
+                _t: PhantomData,
             })
         } else {
             None
