@@ -1,24 +1,24 @@
 [package]
-name = "crustivity_core"
-version = "0.1.0"
-edition = "2021"
+  name = "crustivity_core"
+  version = "0.1.0"
+  edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [lib]
-name = "crustivity_core"
-path = "src/lib.rs"
+  name = "crustivity_core"
+  path = "src/lib.rs"
 
-[[bin]]
-name = "crustivity_core"
-path = "src/main.rs"
+[[bin]]  
+  name = "crustivity_core"  
+  path = "src/main.rs"
 
 [dependencies]
-log = "0.4"
-pretty_env_logger = "0.5.0"
-parking_lot = "0.12.1"
-dashmap = "5.4.0"
-sharded-slab = "0.1.4"
-graphviz-rust = "0.6.2"
-petgraph = "0.6.3"
-slotmap = "1.0.6"
+  log = "0.4"
+  pretty_env_logger = "0.5.0"
+  parking_lot = "0.12.1"
+  dashmap = "5.4.0"
+  sharded-slab = "0.1.4"
+  graphviz-rust = "0.6.2"
+  petgraph = "0.6.3"
+  slotmap = "1.0.6"
